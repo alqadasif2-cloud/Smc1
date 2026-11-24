@@ -5,8 +5,14 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -17,7 +23,10 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -47,9 +56,16 @@ import java.net.NetworkInterface
 import java.net.ProtocolException
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -62,6 +78,7 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_PAIR_CODE = "SMC-AUTO-BRIDGE"
 
         private const val BRIDGE_UDP_PORT = 8766
+        private const val CHART_REFRESH_SEC = 60
         private const val PREFS_NAME = "smc_phone_prefs"
 
         private val TF_NAMES = listOf("M1", "M5", "M15", "M30", "H1", "H4", "D1")
@@ -82,13 +99,32 @@ class MainActivity : AppCompatActivity() {
             "محلي فقط (Wi-Fi)",
             "Firebase فقط"
         )
+
+        // Modern dark trading terminal palette
+        private const val COL_BG = "#0B1120"
+        private const val COL_HEADER = "#0F172A"
+        private const val COL_CARD = "#111827"
+        private const val COL_SURFACE = "#1E293B"
+        private const val COL_BORDER = "#334155"
+        private const val COL_TEXT_PRIMARY = "#F8FAFC"
+        private const val COL_TEXT_SECONDARY = "#94A3B8"
+        private const val COL_ACCENT_CYAN = "#38BDF8"
     }
+
+    data class CandleBar(
+        val timeSec: Long,
+        val open: Double,
+        val high: Double,
+        val low: Double,
+        val close: Double,
+        val vol: Long
+    )
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val netExec = Executors.newCachedThreadPool()
 
-    // Connection settings
-    private var pairCode = ""
+    // Connection & Feedback settings
+    private var pairCode = DEFAULT_PAIR_CODE
     private var connModeIdx = 0 // 0=Auto, 1=Local, 2=Firebase
     private var fbUrl = DEFAULT_FB_URL
     private var fbSecret = DEFAULT_FB_API_KEY
@@ -98,9 +134,12 @@ class MainActivity : AppCompatActivity() {
     private var lastLocalScanMs = 0L
     private var pollingActive = false
     private var isSyncingUi = false
+    private var soundEnabled = true
 
     // Latest synced state & contents
     private var lastSnap: JSONObject? = null
+    private var lastBusyState = false
+    private var pendingAsyncTask: String? = null
     private val localVers = mutableMapOf<String, Int>()
     private val loadedVers = mutableMapOf<String, Int>()
     private var dataText = ""
@@ -110,6 +149,17 @@ class MainActivity : AppCompatActivity() {
     private var promptText = ""
     private var lastListsJson = ""
 
+    // Chart streaming state
+    private var chartStreaming = false
+    private var chartCountdownSec = CHART_REFRESH_SEC
+    private var selectedChartTf = "M15"
+    private var chartSymbol = "XAUUSD"
+    private var chartDigits = 2
+    private var chartBid = 0.0
+    private var chartAsk = 0.0
+    private var chartUpdatedAt = ""
+    private var chartBars = emptyList<CandleBar>()
+
     private var symbolItems = mutableListOf("XAUUSD")
     private var providerItems = DEFAULT_PROVIDERS.toMutableList()
     private var gemModelItems = DEFAULT_GEM_MODELS.toMutableList()
@@ -117,17 +167,21 @@ class MainActivity : AppCompatActivity() {
     private var tgModeItems = DEFAULT_TG_MODES.toMutableList()
     private var presetItems = mutableListOf<String>()
 
-    // Header / Status Views
+    // Header / Feedback / Status Views
     private lateinit var tvPcHeader: TextView
     private lateinit var tvChannelBadge: TextView
     private lateinit var tvMt5Status: TextView
     private lateinit var tvLivePrice: TextView
     private lateinit var tvStatusBar: TextView
     private lateinit var progressBusy: ProgressBar
+    private lateinit var btnSoundToggle: MaterialButton
+    private lateinit var cardFeedback: MaterialCardView
+    private lateinit var tvFeedbackTitle: TextView
+    private lateinit var tvFeedbackSub: TextView
     private lateinit var tabLayout: TabLayout
     private val tabContainers = mutableListOf<View>()
 
-    // Tab 1: Control views
+    // Tab 0: Control views
     private lateinit var spSymbol: Spinner
     private val tfChecks = mutableMapOf<String, CheckBox>()
     private lateinit var cbChain: CheckBox
@@ -140,6 +194,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnMakeFile: MaterialButton
     private lateinit var btnReceiveFile: MaterialButton
     private lateinit var btnWorkflowDownload: MaterialButton
+    private lateinit var btnOpenChartQuick: MaterialButton
     private lateinit var btnAi: MaterialButton
     private lateinit var btnFetchAi: MaterialButton
     private lateinit var btnTgAnswer: MaterialButton
@@ -147,6 +202,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnModels: MaterialButton
     private lateinit var btnSavePc: MaterialButton
     private lateinit var btnStop: MaterialButton
+
+    // Tab 1: Live Chart views
+    private lateinit var btnChartStart: MaterialButton
+    private lateinit var btnChartStop: MaterialButton
+    private lateinit var tvChartTimer: TextView
+    private lateinit var tvChartHud: TextView
+    private lateinit var chartView: CandleChartView
+    private val chartTfButtons = mutableMapOf<String, MaterialButton>()
 
     // Tab 2: Prompts views
     private lateinit var spPreset: Spinner
@@ -180,11 +243,29 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val chartTickRunnable = object : Runnable {
+        override fun run() {
+            if (!chartStreaming) return
+            chartCountdownSec -= 1
+            if (chartCountdownSec <= 0) {
+                chartCountdownSec = CHART_REFRESH_SEC
+                tvChartTimer.text = "⏱ جاري تحديث الشموع من الكمبيوتر..."
+                refreshChartFromPc(silent = true)
+            } else {
+                tvChartTimer.text = "🟢 بث مباشر • التحديث التلقائي كل 1 دقيقة (المتبقي: ${chartCountdownSec}ث)"
+            }
+            mainHandler.postDelayed(this, 1000)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = Color.parseColor(COL_HEADER)
+        window.navigationBarColor = Color.parseColor(COL_BG)
         loadPrefs()
         buildUi()
         applyPrefsToSettingsUi()
+        updateChartControlsUi()
     }
 
     override fun onResume() {
@@ -205,6 +286,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        chartStreaming = false
+        mainHandler.removeCallbacks(chartTickRunnable)
+        mainHandler.removeCallbacks(pollRunnable)
         netExec.shutdownNow()
     }
 
@@ -218,6 +302,9 @@ class MainActivity : AppCompatActivity() {
         fbUrl = p.getString("fb_url", DEFAULT_FB_URL)?.ifBlank { DEFAULT_FB_URL } ?: DEFAULT_FB_URL
         fbSecret = p.getString("fb_secret", DEFAULT_FB_API_KEY)?.ifBlank { DEFAULT_FB_API_KEY } ?: DEFAULT_FB_API_KEY
         manualLocalUrl = p.getString("manual_local", "") ?: ""
+        soundEnabled = p.getBoolean("sound_enabled", true)
+        val savedTf = p.getString("chart_tf", "M15") ?: "M15"
+        if (TF_NAMES.contains(savedTf)) selectedChartTf = savedTf
     }
 
     private fun savePrefs() {
@@ -227,6 +314,8 @@ class MainActivity : AppCompatActivity() {
             .putString("fb_url", fbUrl)
             .putString("fb_secret", fbSecret)
             .putString("manual_local", manualLocalUrl)
+            .putBoolean("sound_enabled", soundEnabled)
+            .putString("chart_tf", selectedChartTf)
             .apply()
     }
 
@@ -235,7 +324,66 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==========================================================
-    // UI Construction (Single-File Material RTL Layout)
+    // Visual + Audio Action Completion Feedback
+    // ==========================================================
+    private fun notifyActionCompleted(success: Boolean, title: String, detail: String = "") {
+        val nowTime = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        mainHandler.post {
+            cardFeedback.visibility = View.VISIBLE
+            if (success) {
+                cardFeedback.setCardBackgroundColor(Color.parseColor("#064E3B"))
+                cardFeedback.strokeColor = Color.parseColor("#10B981")
+                tvFeedbackTitle.setTextColor(Color.parseColor("#A7F3D0"))
+                tvFeedbackTitle.text = "✅ $title"
+                tvFeedbackSub.setTextColor(Color.parseColor("#D1FAE5"))
+            } else {
+                cardFeedback.setCardBackgroundColor(Color.parseColor("#7F1D1D"))
+                cardFeedback.strokeColor = Color.parseColor("#EF4444")
+                tvFeedbackTitle.setTextColor(Color.parseColor("#FECACA"))
+                tvFeedbackTitle.text = "❌ $title"
+                tvFeedbackSub.setTextColor(Color.parseColor("#FEE2E2"))
+            }
+            tvFeedbackSub.text = if (detail.isNotBlank()) "$detail  •  $nowTime" else "وقت الإنجاز: $nowTime"
+            tvStatusBar.text = if (success) "✅ $title" else "❌ $title"
+
+            cardFeedback.alpha = 0.5f
+            cardFeedback.scaleX = 0.98f
+            cardFeedback.scaleY = 0.98f
+            cardFeedback.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(260)
+                .start()
+        }
+        if (soundEnabled) {
+            playFeedbackTone(success)
+        }
+    }
+
+    private fun playFeedbackTone(success: Boolean) {
+        netExec.execute {
+            var tg: ToneGenerator? = null
+            try {
+                tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
+                if (success) {
+                    tg.startTone(ToneGenerator.TONE_PROP_ACK, 220)
+                } else {
+                    tg.startTone(ToneGenerator.TONE_PROP_NACK, 280)
+                }
+                Thread.sleep(320)
+            } catch (_: Throwable) {
+            } finally {
+                try {
+                    tg?.release()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    // ==========================================================
+    // UI Construction (Modern Dark Trading Terminal, RTL)
     // ==========================================================
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -243,17 +391,17 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setBackgroundColor(Color.parseColor("#F1F5F9"))
+            setBackgroundColor(Color.parseColor(COL_BG))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        // Top Header Card
+        // Top Header Surface
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F172A"))
+            setBackgroundColor(Color.parseColor(COL_HEADER))
             setPadding(dp(14), dp(12), dp(14), dp(10))
         }
 
@@ -262,19 +410,41 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         tvPcHeader = TextView(this).apply {
-            text = "SMC Phone — التحكم عن بُعد"
-            setTextColor(Color.WHITE)
-            textSize = 16f
+            text = "SMC Phone Pro"
+            setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+            textSize = 17f
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         tvChannelBadge = TextView(this).apply {
-            text = "جاري الاتصال..."
-            setTextColor(Color.parseColor("#E2E8F0"))
-            textSize = 12f
+            text = "جاري الربط..."
+            setTextColor(Color.parseColor("#38BDF8"))
+            textSize = 11f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(8), 0, dp(8), 0)
+        }
+        btnSoundToggle = MaterialButton(this).apply {
+            text = if (soundEnabled) "🔊" else "🔇"
+            setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+            setBackgroundColor(Color.parseColor(COL_SURFACE))
+            cornerRadius = dp(8)
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            textSize = 13f
+            setOnClickListener {
+                soundEnabled = !soundEnabled
+                savePrefs()
+                text = if (soundEnabled) "🔊" else "🔇"
+                toast(if (soundEnabled) "تم تفعيل التنبيه الصوتي" else "تم كتم التنبيه الصوتي")
+                if (soundEnabled) playFeedbackTone(true)
+            }
         }
         topRow.addView(tvPcHeader)
         topRow.addView(tvChannelBadge)
+        topRow.addView(btnSoundToggle)
         header.addView(topRow)
 
         val statusRow = LinearLayout(this).apply {
@@ -290,7 +460,7 @@ class MainActivity : AppCompatActivity() {
         }
         tvLivePrice = TextView(this).apply {
             text = "—"
-            setTextColor(Color.parseColor("#38BDF8"))
+            setTextColor(Color.parseColor(COL_ACCENT_CYAN))
             textSize = 13f
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         }
@@ -308,24 +478,60 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, dp(6), 0)
         }
         tvStatusBar = TextView(this).apply {
-            text = "متصل تلقائياً عبر Firebase / الشبكة المحلية — في انتظار السكربت على الكمبيوتر"
-            setTextColor(Color.parseColor("#CBD5E1"))
+            text = "متصل تلقائياً عبر الشبكة المحلية أو Firebase"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
             textSize = 12f
         }
         barRow.addView(progressBusy)
         barRow.addView(tvStatusBar)
         header.addView(barRow)
 
+        // Prominent Visual Completion Banner (updates + sound on every action)
+        cardFeedback = MaterialCardView(this).apply {
+            visibility = View.GONE
+            radius = dp(10).toFloat()
+            cardElevation = dp(2).toFloat()
+            strokeWidth = dp(1)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(8), 0, 0) }
+            setOnClickListener { visibility = View.GONE }
+        }
+        val fbInner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        tvFeedbackTitle = TextView(this).apply {
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        tvFeedbackSub = TextView(this).apply {
+            textSize = 11f
+            setPadding(0, dp(2), 0, 0)
+        }
+        fbInner.addView(tvFeedbackTitle)
+        fbInner.addView(tvFeedbackSub)
+        cardFeedback.addView(fbInner)
+        header.addView(cardFeedback)
+
         root.addView(header)
 
-        // Tabs
+        // Hairline Divider
+        root.addView(View(this).apply {
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+        })
+
+        // Modern Dark Tabs
         tabLayout = TabLayout(this).apply {
             tabMode = TabLayout.MODE_SCROLLABLE
-            setBackgroundColor(Color.WHITE)
-            setSelectedTabIndicatorColor(Color.parseColor("#0F172A"))
-            setTabTextColors(Color.parseColor("#64748B"), Color.parseColor("#0F172A"))
+            setBackgroundColor(Color.parseColor(COL_HEADER))
+            setSelectedTabIndicatorColor(Color.parseColor(COL_ACCENT_CYAN))
+            setSelectedTabIndicatorHeight(dp(3))
+            setTabTextColors(Color.parseColor("#94A3B8"), Color.parseColor("#F8FAFC"))
         }
-        val tabTitles = listOf("التحكم", "الأوامر", "البيانات", "الملف txt", "التحليل", "السجل والربط")
+        val tabTitles = listOf("التحكم", "📈 الرسم البياني", "الأوامر", "البيانات", "الملف txt", "التحليل", "السجل والربط")
         tabTitles.forEach { title -> tabLayout.addTab(tabLayout.newTab().setText(title)) }
         root.addView(tabLayout)
 
@@ -339,13 +545,14 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        val t1 = buildControlTab()
+        val t0 = buildControlTab()
+        val t1 = buildChartTab()
         val t2 = buildPromptsTab()
         val t3 = buildDataTab()
         val t4 = buildFileTab()
         val t5 = buildAnswerTab()
         val t6 = buildLogBridgeTab()
-        tabContainers.addAll(listOf(t1, t2, t3, t4, t5, t6))
+        tabContainers.addAll(listOf(t0, t1, t2, t3, t4, t5, t6))
         tabContainers.forEachIndexed { idx, view ->
             view.visibility = if (idx == 0) View.VISIBLE else View.GONE
             contentHost.addView(view)
@@ -357,6 +564,9 @@ class MainActivity : AppCompatActivity() {
                 tabContainers.forEachIndexed { idx, v ->
                     v.visibility = if (idx == tab.position) View.VISIBLE else View.GONE
                 }
+                if (tab.position == 1 && chartBars.isEmpty() && lastSnap?.optBoolean("chart_active", false) == true) {
+                    pullContentAsync("chart", saveToDownloads = false)
+                }
             }
             override fun onTabUnselected(tab: TabLayout.Tab) {}
             override fun onTabReselected(tab: TabLayout.Tab) {}
@@ -367,27 +577,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun card(parent: LinearLayout, title: String): LinearLayout {
         val c = MaterialCardView(this).apply {
-            radius = dp(10).toFloat()
-            cardElevation = dp(1).toFloat()
-            setCardBackgroundColor(Color.WHITE)
-            strokeColor = Color.parseColor("#CBD5E1")
+            radius = dp(14).toFloat()
+            cardElevation = dp(2).toFloat()
+            setCardBackgroundColor(Color.parseColor(COL_CARD))
+            strokeColor = Color.parseColor("#1E293B")
             strokeWidth = dp(1)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, dp(10)) }
+            ).apply { setMargins(0, 0, 0, dp(12)) }
         }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(14), dp(14), dp(14), dp(14))
         }
         if (title.isNotEmpty()) {
             inner.addView(TextView(this).apply {
                 text = title
-                setTextColor(Color.parseColor("#0F172A"))
+                setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
                 textSize = 14f
                 setTypeface(typeface, Typeface.BOLD)
-                setPadding(0, 0, 0, dp(8))
+                setPadding(0, 0, 0, dp(10))
             })
         }
         c.addView(inner)
@@ -400,9 +610,10 @@ class MainActivity : AppCompatActivity() {
             text = label
             setTextColor(Color.parseColor(textHex))
             setBackgroundColor(Color.parseColor(bgHex))
-            cornerRadius = dp(8)
+            cornerRadius = dp(10)
             textSize = 13f
             isAllCaps = false
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             setOnClickListener { onClick() }
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -411,26 +622,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun styleEditText(et: EditText): EditText {
+        return et.apply {
+            setBackgroundColor(Color.parseColor(COL_SURFACE))
+            setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+            setHintTextColor(Color.parseColor("#64748B"))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            textSize = 13f
+        }
+    }
+
     private fun labelRow(parent: LinearLayout, label: String): Spinner {
         parent.addView(TextView(this).apply {
             text = label
-            setTextColor(Color.parseColor("#475569"))
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
             textSize = 12f
-            setPadding(0, dp(4), 0, dp(2))
+            setPadding(0, dp(6), 0, dp(4))
         })
         val sp = Spinner(this).apply {
+            setBackgroundColor(Color.parseColor(COL_SURFACE))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, dp(6)) }
+            ).apply { setMargins(0, 0, 0, dp(8)) }
         }
         parent.addView(sp)
         return sp
     }
 
     private fun setSpinnerItems(sp: Spinner, items: List<String>, selected: String? = null) {
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, items).apply {
-            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val v = super.getView(position, convertView, parent) as TextView
+                v.setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+                v.textSize = 13f
+                v.setPadding(dp(8), dp(6), dp(8), dp(6))
+                return v
+            }
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val v = super.getDropDownView(position, convertView, parent) as TextView
+                v.setBackgroundColor(Color.parseColor(COL_SURFACE))
+                v.setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+                v.textSize = 14f
+                v.setPadding(dp(12), dp(10), dp(12), dp(10))
+                return v
+            }
         }
         sp.adapter = adapter
         if (!selected.isNullOrBlank()) {
@@ -439,7 +677,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------- Tab 1: Control ----------
+    // ---------- Tab 0: Control ----------
     private fun buildControlTab(): View {
         val scroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -451,7 +689,10 @@ class MainActivity : AppCompatActivity() {
 
         // Card 1: MT5 & Symbol
         val c1 = card(box, "1) منصة MT5 والرمز")
-        btnConnect = makeBtn("🔌 اتصال / إعادة اتصال MT5", "#0F172A") { sendAction("connect") }
+        btnConnect = makeBtn("🔌 اتصال / إعادة اتصال MT5", "#0284C7") {
+            pendingAsyncTask = "connect"
+            sendAction("connect")
+        }
         c1.addView(btnConnect)
 
         spSymbol = labelRow(c1, "الرمز (Symbol)")
@@ -467,10 +708,14 @@ class MainActivity : AppCompatActivity() {
         val c2 = card(box, "2) الفريمات")
         val tfWrap = HorizontalScrollView(this)
         val tfRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tintList = ColorStateList.valueOf(Color.parseColor(COL_ACCENT_CYAN))
         TF_NAMES.forEach { tf ->
             val cb = CheckBox(this).apply {
                 text = tf
+                setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+                buttonTintList = tintList
                 isChecked = (tf != "D1")
+                setPadding(dp(4), 0, dp(10), 0)
                 setOnCheckedChangeListener { _, _ -> if (!isSyncingUi) sendSettingsOnly() }
             }
             tfChecks[tf] = cb
@@ -481,6 +726,8 @@ class MainActivity : AppCompatActivity() {
 
         cbChain = CheckBox(this).apply {
             text = "تحليل تلقائياً بعد الجلب"
+            setTextColor(Color.parseColor(COL_TEXT_PRIMARY))
+            buttonTintList = tintList
             setOnCheckedChangeListener { _, _ -> if (!isSyncingUi) sendSettingsOnly() }
         }
         c2.addView(cbChain)
@@ -523,49 +770,248 @@ class MainActivity : AppCompatActivity() {
             override fun onNothingSelected(p: AdapterView<*>?) {}
         }
 
-        btnModels = makeBtn("🔄 تحديث قوائم الموديلات", "#334155") { sendAction("models") }
+        btnModels = makeBtn("🔄 تحديث قوائم الموديلات", "#334155") {
+            sendAction("models", completionLabel = "تحديث قوائم الموديلات")
+        }
         c3.addView(btnModels)
 
-        // Card 4: Action Buttons (1:1 mirror of Desktop Panel + Mobile File Receive)
-        val c4 = card(box, "4) أزرار التنفيذ وإرسال الملفات للهاتف")
+        // Card 4: Action Buttons
+        val c4 = card(box, "4) أزرار التنفيذ والرسم البياني وإرسال الملفات")
+        btnOpenChartQuick = makeBtn("📈 فتح الرسم البياني المباشر (تحديث كل 1د)", "#0EA5E9") {
+            tabLayout.getTabAt(1)?.select()
+            startChartStreaming()
+        }
         btnFetch = makeBtn("📥 جلب البيانات الحية", "#0369A1") {
+            pendingAsyncTask = "fetch"
             sendAction("fetch", collectParams(), pullContentAfter = "data")
         }
-        btnMakeFile = makeBtn("📄 إنشاء الملف فقط (.txt)", "#1D4ED8") {
-            sendAction("make_file", collectParams(), pullContentAfter = "file")
+        btnMakeFile = makeBtn("📄 إنشاء الملف فقط (.txt)", "#2563EB") {
+            sendAction("make_file", collectParams(), pullContentAfter = "file", completionLabel = "إنشاء ملف الطلب (.txt)")
         }
-        btnReceiveFile = makeBtn("⬇️ رفع / استلام الملف إلى الهاتف وحفظه", "#047857") {
+        btnReceiveFile = makeBtn("⬇️ استلام الملف إلى الهاتف وحفظه", "#059669") {
             pullContentAndSaveFile()
         }
-        btnWorkflowDownload = makeBtn("⚡ جلب + إنشاء ملف + استلام للهاتف", "#0F766E") {
+        btnWorkflowDownload = makeBtn("⚡ جلب + إنشاء ملف + استلام للهاتف", "#0D9488") {
             runFetchCreateAndDownloadWorkflow()
         }
-        btnAi = makeBtn("🤖 إنشاء الملف وإرساله للمزوّد", "#4338CA") {
+        btnAi = makeBtn("🤖 إنشاء الملف وإرساله للمزوّد", "#4F46E5") {
+            pendingAsyncTask = "ai"
             sendAction("ai", collectParams(), pullContentAfter = "answer")
         }
-        btnFetchAi = makeBtn("⚡ جلب + تحليل", "#6D28D9") {
+        btnFetchAi = makeBtn("⚡ جلب + تحليل", "#7C3AED") {
+            pendingAsyncTask = "fetch_ai"
             sendAction("fetch_ai", collectParams(), pullContentAfter = "answer")
         }
         btnTgAnswer = makeBtn("📨 إرسال النتيجة إلى Telegram", "#0284C7") {
-            sendAction("tg_answer")
+            sendAction("tg_answer", completionLabel = "إرسال النتيجة إلى Telegram")
         }
         btnTgFile = makeBtn("📎 إنشاء ملف وإرساله إلى Telegram", "#0E7490") {
-            sendAction("tg_file")
+            sendAction("tg_file", completionLabel = "إرسال الملف إلى Telegram")
         }
-        btnSavePc = makeBtn("💾 حفظ الإعدادات على الكمبيوتر", "#475569") {
-            sendAction("save")
+        btnSavePc = makeBtn("💾 حفظ الإعدادات على الكمبيوتر", "#334155") {
+            sendAction("save", completionLabel = "حفظ الإعدادات على الكمبيوتر")
         }
         btnStop = makeBtn("⏹ إيقاف العملية الحالية", "#DC2626") {
-            sendAction("stop")
+            pendingAsyncTask = null
+            sendAction("stop", completionLabel = "إيقاف العملية الحالية")
         }
 
         listOf(
-            btnFetch, btnMakeFile, btnReceiveFile, btnWorkflowDownload,
+            btnOpenChartQuick, btnFetch, btnMakeFile, btnReceiveFile, btnWorkflowDownload,
             btnAi, btnFetchAi, btnTgAnswer, btnTgFile, btnSavePc, btnStop
         ).forEach { c4.addView(it) }
 
         scroll.addView(box)
         return scroll
+    }
+
+    // ---------- Tab 1: Live Interactive Candlestick Chart ----------
+    private fun buildChartTab(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        // Start / Stop streaming row
+        val ctrlRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnChartStart = makeBtn("📈 عرض الرسم البياني", "#059669") {
+            startChartStreaming()
+        }
+        btnChartStop = makeBtn("⏹ إيقاف عرض الرسم البياني", "#DC2626") {
+            stopChartStreaming()
+        }
+        listOf(btnChartStart, btnChartStop).forEach { b ->
+            b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(3), 0, dp(3), dp(6))
+            }
+            ctrlRow.addView(b)
+        }
+        root.addView(ctrlRow)
+
+        // All Timeframes Switcher (M1..D1)
+        val tfScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(6))
+            }
+        }
+        val tfRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        TF_NAMES.forEach { tf ->
+            val b = MaterialButton(this).apply {
+                text = tf
+                textSize = 12f
+                isAllCaps = false
+                cornerRadius = dp(8)
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    setMargins(dp(3), 0, dp(3), 0)
+                }
+                setOnClickListener { switchChartTimeframe(tf) }
+            }
+            chartTfButtons[tf] = b
+            tfRow.addView(b)
+        }
+        tfScroll.addView(tfRow)
+        root.addView(tfScroll)
+
+        // Zoom + Manual Refresh Row
+        val zoomRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val bZoomIn = makeBtn("🔍+", COL_SURFACE) { chartView.zoomBy(1.25f) }
+        val bZoomOut = makeBtn("🔍-", COL_SURFACE) { chartView.zoomBy(0.8f) }
+        val bReset = makeBtn("↺ أحدث شمعة", COL_SURFACE) { chartView.resetView() }
+        val bRefreshNow = makeBtn("🔄 تحديث الآن", "#0284C7") {
+            if (!chartStreaming) {
+                startChartStreaming()
+            } else {
+                chartCountdownSec = CHART_REFRESH_SEC
+                refreshChartFromPc(silent = false)
+            }
+        }
+        listOf(bZoomIn, bZoomOut, bReset, bRefreshNow).forEach { b ->
+            b.textSize = 11f
+            b.setPadding(dp(6), dp(6), dp(6), dp(6))
+            b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(2), 0, dp(2), dp(6))
+            }
+            zoomRow.addView(b)
+        }
+        root.addView(zoomRow)
+
+        // Timer & Status Bar
+        tvChartTimer = TextView(this).apply {
+            text = "⏹ البث متوقف — اضغط 'عرض الرسم البياني' للنقل من الكمبيوتر"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 11f
+            setPadding(dp(4), 0, dp(4), dp(4))
+        }
+        root.addView(tvChartTimer)
+
+        // OHLCV HUD Bar
+        tvChartHud = TextView(this).apply {
+            text = "اسحب للتحريك، قرّب بإصبعين للتكبير، وانقر على أي شمعة لمعاينة تفاصيلها"
+            setBackgroundColor(Color.parseColor(COL_CARD))
+            setTextColor(Color.parseColor(COL_ACCENT_CYAN))
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+        }
+        root.addView(tvChartHud)
+
+        // Interactive Candlestick Canvas
+        val chartCard = MaterialCardView(this).apply {
+            radius = dp(12).toFloat()
+            strokeColor = Color.parseColor("#1E293B")
+            strokeWidth = dp(1)
+            setCardBackgroundColor(Color.parseColor(COL_BG))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+                setMargins(0, dp(6), 0, 0)
+            }
+        }
+        chartView = CandleChartView(this) { bar, isHover ->
+            val d = chartDigits.coerceIn(0, 6)
+            val fmt = "%.${d}f"
+            val tStr = formatUnixTime(bar.timeSec, selectedChartTf)
+            val tag = if (isHover) "📍" else "●"
+            tvChartHud.text = "$tag $chartSymbol ($selectedChartTf) $tStr | O:${String.format(Locale.US, fmt, bar.open)} H:${String.format(Locale.US, fmt, bar.high)} L:${String.format(Locale.US, fmt, bar.low)} C:${String.format(Locale.US, fmt, bar.close)} V:${bar.vol}"
+        }
+        chartCard.addView(chartView)
+        root.addView(chartCard)
+
+        return root
+    }
+
+    private fun startChartStreaming() {
+        chartStreaming = true
+        chartCountdownSec = CHART_REFRESH_SEC
+        mainHandler.removeCallbacks(chartTickRunnable)
+        mainHandler.postDelayed(chartTickRunnable, 1000)
+        updateChartControlsUi()
+        tvChartTimer.text = "🟢 جاري جلب الرسم البياني ($selectedChartTf) من الكمبيوتر..."
+        sendAction(
+            action = "chart_start",
+            params = JSONObject().put("tf", selectedChartTf),
+            pullContentAfter = "chart",
+            completionLabel = "تشغيل الرسم البياني المباشر ($selectedChartTf)"
+        )
+    }
+
+    private fun stopChartStreaming() {
+        chartStreaming = false
+        mainHandler.removeCallbacks(chartTickRunnable)
+        updateChartControlsUi()
+        tvChartTimer.text = "⏹ تم إيقاف عرض الرسم البياني — لا يتم نقل أي بيانات (توفير الاستهلاك)"
+        sendAction(
+            action = "chart_stop",
+            completionLabel = "إيقاف عرض الرسم البياني وتوفير الاستهلاك"
+        )
+    }
+
+    private fun switchChartTimeframe(tf: String) {
+        if (!TF_NAMES.contains(tf)) return
+        selectedChartTf = tf
+        savePrefs()
+        updateChartControlsUi()
+        if (chartStreaming) {
+            chartCountdownSec = CHART_REFRESH_SEC
+            sendAction(
+                action = "chart_tf",
+                params = JSONObject().put("tf", tf),
+                pullContentAfter = "chart",
+                completionLabel = "تغيير فريم الرسم البياني إلى $tf"
+            )
+        } else {
+            startChartStreaming()
+        }
+    }
+
+    private fun refreshChartFromPc(silent: Boolean) {
+        sendAction(
+            action = "chart_refresh",
+            params = JSONObject().put("tf", selectedChartTf),
+            quiet = silent,
+            pullContentAfter = "chart",
+            completionLabel = if (silent) null else "تحديث الرسم البياني ($selectedChartTf)"
+        )
+    }
+
+    private fun updateChartControlsUi() {
+        if (!::btnChartStart.isInitialized) return
+        btnChartStart.isEnabled = !chartStreaming
+        btnChartStart.alpha = if (chartStreaming) 0.55f else 1f
+        btnChartStop.isEnabled = chartStreaming
+        btnChartStop.alpha = if (chartStreaming) 1f else 0.55f
+
+        chartTfButtons.forEach { (tf, btn) ->
+            val active = (tf == selectedChartTf)
+            btn.setBackgroundColor(Color.parseColor(if (active) "#0284C7" else COL_SURFACE))
+            btn.setTextColor(Color.parseColor(if (active) "#FFFFFF" else COL_TEXT_SECONDARY))
+        }
+        if (chartStreaming) {
+            tvChartTimer.text = "🟢 بث مباشر • التحديث التلقائي كل 1 دقيقة (المتبقي: ${chartCountdownSec}ث)"
+        }
     }
 
     // ---------- Tab 2: Prompts ----------
@@ -579,30 +1025,19 @@ class MainActivity : AppCompatActivity() {
         setSpinnerItems(spPreset, listOf("اختر أمراً جاهزاً..."))
 
         val rowBtns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val bAdd = MaterialButton(this).apply {
-            text = "➕ إضافة"
-            isAllCaps = false
-            setOnClickListener {
-                val p = spPreset.selectedItem?.toString() ?: ""
-                if (p.isNotBlank() && !p.startsWith("اختر")) {
-                    val cur = etPrompt.text.toString().trimEnd()
-                    etPrompt.setText(if (cur.isEmpty()) p else "$cur\n$p")
-                }
+        val bAdd = makeBtn("➕ إضافة", "#334155") {
+            val p = spPreset.selectedItem?.toString() ?: ""
+            if (p.isNotBlank() && !p.startsWith("اختر")) {
+                val cur = etPrompt.text.toString().trimEnd()
+                etPrompt.setText(if (cur.isEmpty()) p else "$cur\n$p")
+                notifyActionCompleted(true, "تمت إضافة الأمر الجاهز")
             }
         }
-        val bSavePrompt = MaterialButton(this).apply {
-            text = "💾 حفظ الأوامر"
-            isAllCaps = false
-            setOnClickListener {
-                sendAction("set_prompt", JSONObject().put("text", etPrompt.text.toString()))
-            }
+        val bSavePrompt = makeBtn("💾 حفظ الأوامر", "#059669") {
+            sendAction("set_prompt", JSONObject().put("text", etPrompt.text.toString()), completionLabel = "حفظ الأوامر الافتراضية")
         }
-        val bResetPrompt = MaterialButton(this).apply {
-            text = "↩ استعادة"
-            isAllCaps = false
-            setOnClickListener {
-                sendAction("reset_prompt", pullContentAfter = "prompt")
-            }
+        val bResetPrompt = makeBtn("↩ استعادة", "#475569") {
+            sendAction("reset_prompt", pullContentAfter = "prompt", completionLabel = "استعادة الأوامر الأصلية")
         }
         listOf(bAdd, bSavePrompt, bResetPrompt).forEach { b ->
             b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -612,11 +1047,9 @@ class MainActivity : AppCompatActivity() {
         }
         box.addView(rowBtns)
 
-        etPrompt = EditText(this).apply {
+        etPrompt = styleEditText(EditText(this)).apply {
             gravity = Gravity.TOP or Gravity.START
             textAlignment = View.TEXT_ALIGNMENT_VIEW_START
-            setBackgroundColor(Color.WHITE)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
             textSize = 14f
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -634,10 +1067,11 @@ class MainActivity : AppCompatActivity() {
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val b1 = makeBtn("📥 جلب البيانات الحية", "#0369A1") {
+            pendingAsyncTask = "fetch"
             sendAction("fetch", collectParams(), pullContentAfter = "data")
         }
         val b2 = makeBtn("🔄 سحب أحدث بيانات", "#334155") {
-            pullContentAsync("data", saveToDownloads = false)
+            pullContentAsync("data", saveToDownloads = false, notifyLabel = "تحديث عرض البيانات الحية")
         }
         val b3 = makeBtn("📋 نسخ", "#475569") { copyText("البيانات", dataText) }
         listOf(b1, b2, b3).forEach { b ->
@@ -649,12 +1083,13 @@ class MainActivity : AppCompatActivity() {
         box.addView(row)
 
         val sc = ScrollView(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(COL_CARD))
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         tvDataContent = TextView(this).apply {
             text = "لا توجد بيانات مجلوبة بعد — اضغط 'جلب البيانات الحية'."
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setTextIsSelectable(true)
             typeface = Typeface.MONOSPACE
             textSize = 12f
@@ -673,19 +1108,20 @@ class MainActivity : AppCompatActivity() {
         }
         tvFileNameLabel = TextView(this).apply {
             text = "الملف الحالي: لا يوجد"
+            setTextColor(Color.parseColor(COL_ACCENT_CYAN))
             setTypeface(typeface, Typeface.BOLD)
             setPadding(0, 0, 0, dp(6))
         }
         box.addView(tvFileNameLabel)
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val bCreate = makeBtn("📄 إنشاء الملف", "#1D4ED8") {
-            sendAction("make_file", collectParams(), pullContentAfter = "file")
+        val bCreate = makeBtn("📄 إنشاء الملف", "#2563EB") {
+            sendAction("make_file", collectParams(), pullContentAfter = "file", completionLabel = "إنشاء ملف الطلب (.txt)")
         }
-        val bPullSave = makeBtn("⬇️ استلام وحفظ للهاتف", "#047857") {
+        val bPullSave = makeBtn("⬇️ استلام وحفظ للهاتف", "#059669") {
             pullContentAndSaveFile()
         }
-        val bShare = makeBtn("📤 مشاركة", "#0F172A") {
+        val bShare = makeBtn("📤 مشاركة", "#334155") {
             shareFileText()
         }
         listOf(bCreate, bPullSave, bShare).forEach { b ->
@@ -697,12 +1133,13 @@ class MainActivity : AppCompatActivity() {
         box.addView(row)
 
         val sc = ScrollView(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(COL_CARD))
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         tvFileContent = TextView(this).apply {
             text = "لم يتم إنشاء أو استلام ملف بعد."
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setTextIsSelectable(true)
             typeface = Typeface.MONOSPACE
             textSize = 12f
@@ -721,6 +1158,7 @@ class MainActivity : AppCompatActivity() {
         }
         tvAnswerLabel = TextView(this).apply {
             text = "نتيجة التحليل"
+            setTextColor(Color.parseColor(COL_ACCENT_CYAN))
             setTypeface(typeface, Typeface.BOLD)
             setPadding(0, 0, 0, dp(6))
         }
@@ -728,8 +1166,10 @@ class MainActivity : AppCompatActivity() {
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val bCopy = makeBtn("📋 نسخ النتيجة", "#334155") { copyText("النتيجة", answerText) }
-        val bTg = makeBtn("📨 إرسال لـ Telegram", "#0284C7") { sendAction("tg_answer") }
-        val bShare = makeBtn("📤 مشاركة", "#0F172A") { sharePlainText(answerText, "نتيجة تحليل SMC") }
+        val bTg = makeBtn("📨 إرسال لـ Telegram", "#0284C7") {
+            sendAction("tg_answer", completionLabel = "إرسال النتيجة إلى Telegram")
+        }
+        val bShare = makeBtn("📤 مشاركة", "#0F766E") { sharePlainText(answerText, "نتيجة تحليل SMC") }
         listOf(bCopy, bTg, bShare).forEach { b ->
             b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 setMargins(dp(3), 0, dp(3), dp(6))
@@ -739,12 +1179,13 @@ class MainActivity : AppCompatActivity() {
         box.addView(row)
 
         val sc = ScrollView(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(COL_CARD))
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         tvAnswerContent = TextView(this).apply {
             text = "لا توجد نتيجة تحليل بعد."
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setTextColor(Color.parseColor("#F1F5F9"))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setTextIsSelectable(true)
             textSize = 14f
         }
@@ -764,9 +1205,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val cConn = card(box, "إعدادات الربط (تلقائي: محلي Wi-Fi + Firebase افتراضياً)")
-        cConn.addView(TextView(this).apply { text = "رمز الربط (من القسم 4 في اللوحة الأم على الكمبيوتر)"; textSize = 12f })
-        etPairCode = EditText(this).apply {
-            hint = "مثال: ABCD-EFGH-JKLM"
+        cConn.addView(TextView(this).apply {
+            text = "رمز الربط (مشترك تلقائياً بدون إدخال يدوي)"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 12f
+            setPadding(0, 0, 0, dp(4))
+        })
+        etPairCode = styleEditText(EditText(this)).apply {
+            hint = DEFAULT_PAIR_CODE
             isSingleLine = true
         }
         cConn.addView(etPairCode)
@@ -774,59 +1220,77 @@ class MainActivity : AppCompatActivity() {
         spConnMode = labelRow(cConn, "طريقة الاتصال")
         setSpinnerItems(spConnMode, MODE_LABELS, MODE_LABELS[connModeIdx])
 
-        cConn.addView(TextView(this).apply { text = "عنوان المحلي اليدوي (اختياري، مثال: http://192.168.1.10:8765)"; textSize = 12f })
-        etManualLocal = EditText(this).apply {
+        cConn.addView(TextView(this).apply {
+            text = "عنوان المحلي اليدوي (اختياري، مثال: http://192.168.1.10:8765)"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        etManualLocal = styleEditText(EditText(this)).apply {
             hint = "http://192.168.1.x:8765"
             isSingleLine = true
         }
         cConn.addView(etManualLocal)
 
-        cConn.addView(TextView(this).apply { text = "رابط Firebase (مربوط افتراضياً)"; textSize = 12f })
-        etFbUrl = EditText(this).apply { isSingleLine = true }
+        cConn.addView(TextView(this).apply {
+            text = "رابط Firebase (مربوط افتراضياً)"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        etFbUrl = styleEditText(EditText(this)).apply { isSingleLine = true }
         cConn.addView(etFbUrl)
 
-        cConn.addView(TextView(this).apply { text = "مفتاح Firebase API Key / Secret"; textSize = 12f })
-        etFbSecret = EditText(this).apply {
+        cConn.addView(TextView(this).apply {
+            text = "مفتاح Firebase API Key / Secret"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        etFbSecret = styleEditText(EditText(this)).apply {
             isSingleLine = true
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         cConn.addView(etFbSecret)
 
-        cConn.addView(makeBtn("💾 حفظ الإعدادات وتطبيق الربط", "#0F172A") {
-            pairCode = etPairCode.text.toString().trim().uppercase(Locale.US)
+        cConn.addView(makeBtn("💾 حفظ الإعدادات وتطبيق الربط", "#059669") {
+            pairCode = etPairCode.text.toString().trim().uppercase(Locale.US).ifBlank { DEFAULT_PAIR_CODE }
             connModeIdx = spConnMode.selectedItemPosition.coerceIn(0, 2)
             manualLocalUrl = etManualLocal.text.toString().trim().trimEnd('/')
             fbUrl = etFbUrl.text.toString().trim().ifBlank { DEFAULT_FB_URL }
             fbSecret = etFbSecret.text.toString().trim().ifBlank { DEFAULT_FB_API_KEY }
             savePrefs()
-            toast("تم حفظ إعدادات الربط")
+            notifyActionCompleted(true, "تم حفظ إعدادات الربط وتطبيقها")
             if (connModeIdx != 2) scanLocalNetworkAsync(silent = false)
             pollOnce()
         })
 
-        cConn.addView(makeBtn("🔍 مسح الشبكة المحلية (Wi-Fi) الآن", "#0369A1") {
+        cConn.addView(makeBtn("🔍 مسح الشبكة المحلية (Wi-Fi) الآن", "#0284C7") {
             scanLocalNetworkAsync(silent = false)
         })
 
-        cConn.addView(makeBtn("↩ استعادة إعدادات Firebase الافتراضية", "#475569") {
+        cConn.addView(makeBtn("↩ استعادة إعدادات Firebase الافتراضية", "#334155") {
+            pairCode = DEFAULT_PAIR_CODE
             fbUrl = DEFAULT_FB_URL
             fbSecret = DEFAULT_FB_API_KEY
             connModeIdx = 0
             savePrefs()
             applyPrefsToSettingsUi()
-            toast("تمت استعادة Firebase الافتراضي")
+            notifyActionCompleted(true, "تمت استعادة إعدادات Firebase الافتراضية")
         })
 
         tvDiagInfo = TextView(this).apply {
             text = "الحالة: في انتظار الاتصال..."
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
             textSize = 12f
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         }
         cConn.addView(tvDiagInfo)
 
         val cLog = card(box, "سجل الكمبيوتر المباشر")
         tvLogContent = TextView(this).apply {
             text = "—"
+            setTextColor(Color.parseColor("#CBD5E1"))
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextIsSelectable(true)
@@ -868,12 +1332,12 @@ class MainActivity : AppCompatActivity() {
             if (found != null) {
                 discoveredLocalUrl = found
                 mainHandler.post {
-                    if (!silent) toast("تم اكتشاف اللوحة محلياً: $found")
                     tvDiagInfo.text = "محلي مكتشف: $found"
+                    if (!silent) notifyActionCompleted(true, "تم اكتشاف اللوحة على الشبكة المحلية", found)
                 }
             } else if (!silent) {
                 mainHandler.post {
-                    toast("لم يُعثر على الكمبيوتر في الشبكة المحلية — سيتم استخدام Firebase تلقائياً")
+                    notifyActionCompleted(true, "سيتم استخدام Firebase السحابي تلقائياً", "لم يُعثر على الكمبيوتر في نفس الشبكة")
                 }
             }
         }
@@ -950,7 +1414,7 @@ class MainActivity : AppCompatActivity() {
         method: String = "GET",
         bodyStr: String? = null,
         headers: Map<String, String> = emptyMap(),
-        timeoutMs: Int = 6000
+        timeoutMs: Int = 6500
     ): Pair<Int, String> {
         val url = URL(urlStr)
         val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -1035,6 +1499,8 @@ class MainActivity : AppCompatActivity() {
             put("claude_model", doc.optString("claude_model", DEFAULT_CLAUDE_MODELS.first()))
             put("tg_mode", doc.optString("tg_mode", "يدوي"))
             put("label", doc.optString("label", ""))
+            put("chart_active", doc.optBoolean("chart_active", false))
+            put("chart_tf", doc.optString("chart_tf", selectedChartTf))
             put("vers", versObj)
             put("log", doc.optString("log", ""))
             put("ts", doc.optLong("ts", 0L))
@@ -1046,7 +1512,7 @@ class MainActivity : AppCompatActivity() {
         if (code.length < 12) {
             mainHandler.post {
                 tvChannelBadge.text = "🔴 أدخل رمز الربط"
-                tvStatusBar.text = "افتح تبويب 'السجل والربط' وأدخل رمز الربط الموجود في القسم 4 على الكمبيوتر"
+                tvStatusBar.text = "افتح تبويب 'السجل والربط' وتأكد من رمز الربط"
             }
             return
         }
@@ -1091,7 +1557,7 @@ class MainActivity : AppCompatActivity() {
                             snap = fsRoomToState(fsDecodeDoc(body))
                             channel = "firebase"
                         } else if (sc == 404) {
-                            errMsg = "الغرفة غير موجودة بعد — شغّل السكربت على الكمبيوتر بنفس الرمز"
+                            errMsg = "بانتظار تشغيل سكربت smc_control_panel.py على الكمبيوتر"
                         } else {
                             errMsg = "Firebase HTTP $sc"
                         }
@@ -1131,16 +1597,33 @@ class MainActivity : AppCompatActivity() {
 
         val mt5Ok = snap.optBoolean("mt5", false)
         tvMt5Status.text = snap.optString("conn", if (mt5Ok) "● متصل" else "● غير متصل")
-        tvMt5Status.setTextColor(Color.parseColor(if (mt5Ok) "#86EFAC" else "#FCA5A5"))
+        tvMt5Status.setTextColor(Color.parseColor(if (mt5Ok) "#34D399" else "#FCA5A5"))
 
         val price = snap.optString("price", "")
         tvLivePrice.text = if (price.isNotBlank()) price else "—"
 
         val busy = snap.optBoolean("busy", false)
         val ai = snap.optBoolean("ai", false)
+        val statusTxt = snap.optString("status", "جاهز")
         progressBusy.visibility = if (busy || ai) View.VISIBLE else View.GONE
         btnStop.isEnabled = ai || busy
-        tvStatusBar.text = snap.optString("status", "جاهز")
+        tvStatusBar.text = statusTxt
+
+        // Detect completion of long async PC operations (connect / fetch / ai / fetch_ai)
+        if (lastBusyState && !busy && pendingAsyncTask != null) {
+            val doneTask = pendingAsyncTask
+            pendingAsyncTask = null
+            val ok = !statusTxt.startsWith("❌") && !statusTxt.startsWith("⚠")
+            val label = when (doneTask) {
+                "connect" -> if (mt5Ok) "تم الاتصال بمنصة MT5" else "فشل الاتصال بـ MT5"
+                "fetch" -> "تم جلب البيانات الحية من MT5"
+                "ai" -> "اكتمل تحليل الذكاء الاصطناعي"
+                "fetch_ai" -> "اكتمل جلب البيانات والتحليل"
+                else -> "تم إتمام العملية"
+            }
+            notifyActionCompleted(ok && (doneTask != "connect" || mt5Ok), label, statusTxt)
+        }
+        lastBusyState = busy
 
         isSyncingUi = true
         try {
@@ -1193,7 +1676,11 @@ class MainActivity : AppCompatActivity() {
 
         val vers = snap.optJSONObject("vers")
         if (vers != null) {
-            listOf("lists", "data", "file", "answer", "prompt").forEach { k ->
+            val keys = mutableListOf("lists", "data", "file", "answer", "prompt")
+            if (chartStreaming) {
+                keys.add("chart")
+            }
+            keys.forEach { k ->
                 val v = vers.optInt(k, 0)
                 localVers[k] = v
                 if (v > 0 && loadedVers[k] != v) {
@@ -1212,11 +1699,12 @@ class MainActivity : AppCompatActivity() {
         action: String,
         params: JSONObject = JSONObject(),
         quiet: Boolean = false,
-        pullContentAfter: String? = null
+        pullContentAfter: String? = null,
+        completionLabel: String? = null
     ) {
         val code = normCode(pairCode)
         if (code.length < 12) {
-            if (!quiet) toast("أدخل رمز الربط أولاً من تبويب 'السجل والربط'")
+            if (!quiet) notifyActionCompleted(false, "رمز الربط غير مكتمل", "تحقق من تبويب السجل والربط")
             return
         }
         netExec.execute {
@@ -1224,20 +1712,32 @@ class MainActivity : AppCompatActivity() {
                 val res = executeRemoteAction(code, action, params)
                 val ok = res.optBoolean("ok", false)
                 val err = res.optString("error", "")
-                mainHandler.post {
-                    if (!ok && !quiet) {
-                        toast(err.ifBlank { "تعذر تنفيذ الأمر: $action" })
-                    } else if (ok && !quiet && pullContentAfter == null) {
-                        toast("تم إرسال الأمر: $action")
+                if (!ok) {
+                    pendingAsyncTask = null
+                    if (!quiet) {
+                        notifyActionCompleted(false, "تعذر تنفيذ: ${completionLabel ?: action}", err.ifBlank { "تحقق من اتصال الكمبيوتر" })
                     }
+                    return@execute
                 }
-                if (ok && pullContentAfter != null) {
-                    Thread.sleep(650)
-                    pullContentBlocking(pullContentAfter, saveToDownloads = (pullContentAfter == "file" && action == "make_file"))
+                if (pullContentAfter != null) {
+                    val waitMs = if (pullContentAfter == "chart") 950L else 650L
+                    Thread.sleep(waitMs)
+                    val pulled = pullContentBlocking(
+                        pullContentAfter,
+                        saveToDownloads = (pullContentAfter == "file" && action == "make_file")
+                    )
+                    if (completionLabel != null && pullContentAfter != "file") {
+                        if (pulled || pullContentAfter != "chart") {
+                            notifyActionCompleted(true, completionLabel)
+                        }
+                    }
+                } else if (!quiet && completionLabel != null) {
+                    notifyActionCompleted(true, completionLabel)
                 }
             } catch (e: Throwable) {
-                mainHandler.post {
-                    if (!quiet) toast("خطأ: ${e.message ?: e.javaClass.simpleName}")
+                pendingAsyncTask = null
+                if (!quiet) {
+                    notifyActionCompleted(false, "خطأ في الاتصال", e.message ?: e.javaClass.simpleName)
                 }
             }
         }
@@ -1274,7 +1774,7 @@ class MainActivity : AppCompatActivity() {
             val respUrl = "${firestoreBaseUrl()}/rooms/$room/items/resp?key=$keyParam"
             val deadline = System.currentTimeMillis() + 18000L
             while (System.currentTimeMillis() < deadline) {
-                Thread.sleep(600)
+                Thread.sleep(550)
                 val (rsc, rbody) = httpJson(respUrl, "GET", timeoutMs = 5000)
                 if (rsc == 200) {
                     val doc = fsDecodeDoc(rbody)
@@ -1299,15 +1799,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun pullContentAsync(key: String, saveToDownloads: Boolean) {
-        netExec.execute { pullContentBlocking(key, saveToDownloads) }
+    private fun pullContentAsync(key: String, saveToDownloads: Boolean, notifyLabel: String? = null) {
+        netExec.execute {
+            val ok = pullContentBlocking(key, saveToDownloads)
+            if (notifyLabel != null) {
+                notifyActionCompleted(ok, if (ok) notifyLabel else "تعذر سحب المحتوى ($key)")
+            }
+        }
     }
 
     private fun pullContentAndSaveFile() {
         netExec.execute {
             val ok = pullContentBlocking("file", saveToDownloads = true)
             if (!ok) {
-                mainHandler.post { toast("لا يوجد ملف جاهز بعد — اضغط 'إنشاء الملف' أولاً") }
+                notifyActionCompleted(false, "لا يوجد ملف جاهز بعد", "اضغط 'إنشاء الملف فقط' أولاً")
             }
         }
     }
@@ -1315,7 +1820,7 @@ class MainActivity : AppCompatActivity() {
     private fun runFetchCreateAndDownloadWorkflow() {
         val code = normCode(pairCode)
         if (code.length < 12) {
-            toast("أدخل رمز الربط أولاً")
+            notifyActionCompleted(false, "رمز الربط غير مكتمل")
             return
         }
         mainHandler.post {
@@ -1326,10 +1831,9 @@ class MainActivity : AppCompatActivity() {
             try {
                 val r1 = executeRemoteAction(code, "fetch", collectParams())
                 if (!r1.optBoolean("ok", false)) {
-                    mainHandler.post { toast(r1.optString("error", "فشل جلب البيانات")) }
+                    notifyActionCompleted(false, "فشل جلب البيانات الحية", r1.optString("error", ""))
                     return@execute
                 }
-                // Wait for PC busy flag to finish fetching
                 val deadline = System.currentTimeMillis() + 90000L
                 Thread.sleep(1500)
                 while (System.currentTimeMillis() < deadline) {
@@ -1342,14 +1846,17 @@ class MainActivity : AppCompatActivity() {
                 mainHandler.post { tvStatusBar.text = "📄 2/3 جاري إنشاء ملف .txt على الكمبيوتر..." }
                 val r2 = executeRemoteAction(code, "make_file", collectParams())
                 if (!r2.optBoolean("ok", false)) {
-                    mainHandler.post { toast(r2.optString("error", "فشل إنشاء الملف")) }
+                    notifyActionCompleted(false, "فشل إنشاء الملف", r2.optString("error", ""))
                     return@execute
                 }
                 mainHandler.post { tvStatusBar.text = "⬇️ 3/3 جاري استلام وحفظ الملف في الهاتف..." }
                 Thread.sleep(800)
-                pullContentBlocking("file", saveToDownloads = true)
+                val ok = pullContentBlocking("file", saveToDownloads = true)
+                if (!ok) {
+                    notifyActionCompleted(false, "تعذر استلام الملف النهائي")
+                }
             } catch (e: Throwable) {
-                mainHandler.post { toast("تعذر إتمام السير: ${e.message}") }
+                notifyActionCompleted(false, "تعذر إتمام العملية المتكاملة", e.message ?: "")
             } finally {
                 mainHandler.post { progressBusy.visibility = View.GONE }
             }
@@ -1400,8 +1907,9 @@ class MainActivity : AppCompatActivity() {
                     tvFileContent.text = text
                     if (saveToDownloads) {
                         val saved = saveTextFileToDownloads(name, text)
-                        toast(if (saved != null) "✅ تم استلام وحفظ الملف: Downloads/SMC/$name" else "✅ تم استلام الملف: $name")
-                        tabLayout.getTabAt(3)?.select()
+                        val msg = if (saved != null) "Downloads/SMC/$name" else name
+                        notifyActionCompleted(true, "تم استلام وحفظ الملف بنجاح", msg)
+                        tabLayout.getTabAt(4)?.select()
                     }
                 }
                 "answer" -> {
@@ -1418,9 +1926,54 @@ class MainActivity : AppCompatActivity() {
                         applyListsJson(text)
                     }
                 }
+                "chart" -> {
+                    applyChartJson(text)
+                }
             }
         }
         return true
+    }
+
+    private fun applyChartJson(raw: String) {
+        try {
+            val js = JSONObject(raw)
+            val sym = js.optString("symbol", "XAUUSD")
+            val tf = js.optString("tf", selectedChartTf)
+            val digits = js.optInt("digits", 2).coerceIn(0, 6)
+            val bid = js.optDouble("bid", 0.0)
+            val ask = js.optDouble("ask", bid)
+            val updated = js.optString("updated", "")
+            val arr = js.optJSONArray("candles") ?: return
+            val list = ArrayList<CandleBar>(arr.length())
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONArray(i) ?: continue
+                if (row.length() < 5) continue
+                list.add(
+                    CandleBar(
+                        timeSec = row.optLong(0, 0L),
+                        open = row.optDouble(1, 0.0),
+                        high = row.optDouble(2, 0.0),
+                        low = row.optDouble(3, 0.0),
+                        close = row.optDouble(4, 0.0),
+                        vol = row.optLong(5, 0L)
+                    )
+                )
+            }
+            if (list.isEmpty()) return
+            chartSymbol = sym
+            if (TF_NAMES.contains(tf)) selectedChartTf = tf
+            chartDigits = digits
+            chartBid = bid
+            chartAsk = ask
+            chartUpdatedAt = updated
+            chartBars = list
+            updateChartControlsUi()
+            chartView.setChartData(sym, tf, digits, bid, ask, list)
+            val fmt = "%.${digits}f"
+            val last = list.last()
+            tvChartHud.text = "$sym ($tf) | O:${String.format(Locale.US, fmt, last.open)} H:${String.format(Locale.US, fmt, last.high)} L:${String.format(Locale.US, fmt, last.low)} C:${String.format(Locale.US, fmt, last.close)} | Bid:${String.format(Locale.US, fmt, bid)} ($updated)"
+        } catch (_: Throwable) {
+        }
     }
 
     private fun applyListsJson(raw: String) {
@@ -1515,7 +2068,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun shareFileText() {
         if (fileText.isBlank()) {
-            toast("لا يوجد ملف لمشاركته — استلم الملف أولاً")
+            notifyActionCompleted(false, "لا يوجد ملف لمشاركته", "استلم الملف أولاً")
             return
         }
         val uri = saveTextFileToDownloads(fileName, fileText)
@@ -1534,7 +2087,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun sharePlainText(text: String, subject: String) {
         if (text.isBlank()) {
-            toast("لا يوجد نص للمشاركة")
+            notifyActionCompleted(false, "لا يوجد نص للمشاركة")
             return
         }
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -1547,15 +2100,277 @@ class MainActivity : AppCompatActivity() {
 
     private fun copyText(label: String, text: String) {
         if (text.isBlank()) {
-            toast("لا يوجد محتوى لنسخه")
+            notifyActionCompleted(false, "لا يوجد محتوى لنسخه")
             return
         }
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText(label, text))
-        toast("تم نسخ $label")
+        notifyActionCompleted(true, "تم نسخ $label إلى الحافظة")
     }
 
     private fun toast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun formatUnixTime(sec: Long, tf: String): String {
+        val df = SimpleDateFormat(if (tf == "H4" || tf == "D1") "MM-dd HH:mm" else "HH:mm", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("GMT+03:00")
+        }
+        return df.format(Date(sec * 1000L))
+    }
+
+    // ==========================================================
+    // Interactive Candlestick Canvas View (Pan + Pinch Zoom + Crosshair)
+    // ==========================================================
+    inner class CandleChartView(
+        context: Context,
+        private val onBarInspect: (CandleBar, Boolean) -> Unit
+    ) : View(context) {
+
+        private var bars: List<CandleBar> = emptyList()
+        private var sym: String = "XAUUSD"
+        private var tf: String = "M15"
+        private var digits: Int = 2
+        private var bid: Double = 0.0
+        private var ask: Double = 0.0
+
+        private var candleStepPx = dp(10).toFloat()
+        private var viewOffset = 0
+        private var dragStartX = 0f
+        private var dragStartY = 0f
+        private var dragStartOffset = 0
+        private var isDragging = false
+        private var crossX = -1f
+        private var crossY = -1f
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+        private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                zoomBy(detector.scaleFactor)
+                return true
+            }
+        })
+
+        private val bgPaint = Paint().apply { color = Color.parseColor(COL_BG) }
+        private val gridPaint = Paint().apply {
+            color = Color.parseColor("#1E293B")
+            strokeWidth = 1.5f
+            pathEffect = DashPathEffect(floatArrayOf(6f, 6f), 0f)
+        }
+        private val axisPaint = Paint().apply {
+            color = Color.parseColor("#334155")
+            strokeWidth = 2f
+        }
+        private val axisTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#94A3B8")
+            textSize = dp(10).toFloat()
+            typeface = Typeface.MONOSPACE
+        }
+        private val emptyTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#64748B")
+            textSize = dp(14).toFloat()
+            textAlign = Paint.Align.CENTER
+        }
+        private val bullPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#10B981")
+            strokeWidth = 2.5f
+        }
+        private val bearPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#EF4444")
+            strokeWidth = 2.5f
+        }
+        private val bidLinePaint = Paint().apply {
+            color = Color.parseColor("#38BDF8")
+            strokeWidth = 2.5f
+            pathEffect = DashPathEffect(floatArrayOf(10f, 6f), 0f)
+        }
+        private val bidTagPaint = Paint().apply {
+            color = Color.parseColor("#0284C7")
+        }
+        private val bidTagTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = dp(10).toFloat()
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        }
+        private val crossPaint = Paint().apply {
+            color = Color.parseColor("#64748B")
+            strokeWidth = 2f
+            pathEffect = DashPathEffect(floatArrayOf(8f, 6f), 0f)
+        }
+
+        fun setChartData(s: String, t: String, d: Int, b: Double, a: Double, list: List<CandleBar>) {
+            sym = s
+            tf = t
+            digits = d
+            bid = b
+            ask = a
+            bars = list
+            viewOffset = viewOffset.coerceIn(0, max(0, bars.size - 8))
+            invalidate()
+        }
+
+        fun zoomBy(factor: Float) {
+            candleStepPx = (candleStepPx * factor).coerceIn(dp(4).toFloat(), dp(36).toFloat())
+            invalidate()
+        }
+
+        fun resetView() {
+            viewOffset = 0
+            candleStepPx = dp(10).toFloat()
+            crossX = -1f
+            crossY = -1f
+            invalidate()
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            scaleDetector.onTouchEvent(event)
+            if (scaleDetector.isInProgress) {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    dragStartX = event.x
+                    dragStartY = event.y
+                    dragStartOffset = viewOffset
+                    isDragging = false
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.x - dragStartX
+                    val dy = event.y - dragStartY
+                    if (!isDragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                        isDragging = true
+                    }
+                    if (isDragging && bars.isNotEmpty()) {
+                        val shift = (dx / max(4f, candleStepPx)).roundToInt()
+                        val maxOff = max(0, bars.size - 8)
+                        viewOffset = (dragStartOffset + shift).coerceIn(0, maxOff)
+                        invalidate()
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!isDragging) {
+                        if (crossX >= 0f && abs(event.x - crossX) < dp(18) && abs(event.y - crossY) < dp(18)) {
+                            crossX = -1f
+                            crossY = -1f
+                            if (bars.isNotEmpty()) onBarInspect(bars.last(), false)
+                        } else {
+                            crossX = event.x
+                            crossY = event.y
+                            inspectAt(crossX)
+                        }
+                        invalidate()
+                    }
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+
+        private fun inspectAt(xPos: Float) {
+            if (bars.isEmpty() || width <= 0) return
+            val padL = dp(10).toFloat()
+            val padR = dp(68).toFloat()
+            val plotW = max(40f, width - padL - padR)
+            val step = max(4f, candleStepPx)
+            val visibleCount = max(8, (plotW / step).toInt())
+            val endIdx = max(1, bars.size - viewOffset)
+            val startIdx = max(0, endIdx - visibleCount)
+            val vis = bars.subList(startIdx, endIdx)
+            if (vis.isEmpty()) return
+            val idx = ((xPos - padL) / step).toInt().coerceIn(0, vis.size - 1)
+            onBarInspect(vis[idx], true)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            canvas.drawRect(0f, 0f, w, h, bgPaint)
+
+            if (bars.isEmpty()) {
+                canvas.drawText("اضغط 'عرض الرسم البياني' لنقل الشموع الحية", w / 2f, h / 2f, emptyTextPaint)
+                return
+            }
+
+            val padL = dp(10).toFloat()
+            val padT = dp(16).toFloat()
+            val padR = dp(68).toFloat()
+            val padB = dp(26).toFloat()
+            val plotW = max(40f, w - padL - padR)
+            val plotH = max(40f, h - padT - padB)
+
+            val step = max(4f, candleStepPx)
+            val visibleCount = max(8, (plotW / step).toInt())
+            val endIdx = max(1, bars.size - viewOffset)
+            val startIdx = max(0, endIdx - visibleCount)
+            val vis = bars.subList(startIdx, endIdx)
+            if (vis.isEmpty()) return
+
+            var hi = vis.maxOf { it.high }
+            var lo = vis.minOf { it.low }
+            if (bid > 0 && viewOffset == 0) {
+                hi = max(hi, bid)
+                lo = min(lo, bid)
+            }
+            var rng = hi - lo
+            if (rng <= 0.0) rng = max(abs(hi) * 0.001, 0.01)
+            val pMax = hi + rng * 0.08
+            val pMin = lo - rng * 0.08
+            val pRng = max(1e-9, pMax - pMin)
+
+            fun yOf(p: Double): Float = (padT + ((pMax - p) / pRng) * plotH).toFloat()
+
+            val fmt = "%.${digits.coerceIn(0, 6)}f"
+            for (i in 0..5) {
+                val frac = i / 5.0
+                val yy = (padT + frac * plotH).toFloat()
+                val pv = pMax - frac * pRng
+                canvas.drawLine(padL, yy, w - padR, yy, gridPaint)
+                canvas.drawText(String.format(Locale.US, fmt, pv), w - padR + dp(5), yy + dp(3), axisTextPaint)
+            }
+
+            canvas.drawLine(w - padR, padT, w - padR, h - padB, axisPaint)
+            canvas.drawLine(padL, h - padB, w - padR, h - padB, axisPaint)
+
+            val bodyHalf = max(1.5f, step * 0.33f)
+            val labelEvery = max(1, vis.size / 5)
+            for (i in vis.indices) {
+                val cx = padL + (i + 0.5f) * step
+                if (cx > w - padR - 2f) break
+                val bar = vis[i]
+                val paint = if (bar.close >= bar.open) bullPaint else bearPaint
+                val yHi = yOf(bar.high)
+                val yLo = yOf(bar.low)
+                val yOp = yOf(bar.open)
+                val yCl = yOf(bar.close)
+                canvas.drawLine(cx, yHi, cx, yLo, paint)
+                val topY = min(yOp, yCl)
+                val botY = max(max(yOp, yCl), topY + 2f)
+                canvas.drawRect(cx - bodyHalf, topY, cx + bodyHalf, botY, paint)
+
+                if (i % labelEvery == 0) {
+                    val lbl = formatUnixTime(bar.timeSec, tf)
+                    canvas.drawText(lbl, cx - dp(14), h - dp(8), axisTextPaint)
+                }
+            }
+
+            if (bid > 0 && bid in pMin..pMax) {
+                val yb = yOf(bid)
+                canvas.drawLine(padL, yb, w - padR, yb, bidLinePaint)
+                canvas.drawRect(w - padR + 2f, yb - dp(9), w - 2f, yb + dp(9), bidTagPaint)
+                canvas.drawText(String.format(Locale.US, fmt, bid), w - padR + dp(5), yb + dp(3), bidTagTextPaint)
+            }
+
+            if (crossX in padL..(w - padR) && crossY in padT..(h - padB)) {
+                val idx = ((crossX - padL) / step).toInt().coerceIn(0, vis.size - 1)
+                val sx = padL + (idx + 0.5f) * step
+                canvas.drawLine(sx, padT, sx, h - padB, crossPaint)
+                canvas.drawLine(padL, crossY, w - padR, crossY, crossPaint)
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Cloud,
@@ -35,7 +35,9 @@ import {
   EXPORT_PREVIEWS,
 } from './utils/exportStudio';
 
-type WorkspaceTab = 'control' | 'files' | 'answer' | 'export';
+import LiveCandleChart, { type ChartPayload } from './components/LiveCandleChart';
+
+type WorkspaceTab = 'control' | 'chart' | 'files' | 'answer' | 'export';
 
 const TF_LIST = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'] as const;
 const DEFAULT_PROVIDERS = ['Gemini', 'Claude (عبر API)', 'Claude Code (مباشر بدون API)'];
@@ -78,6 +80,11 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [isExportingZip, setIsExportingZip] = useState<boolean>(false);
   const [workflowRunning, setWorkflowRunning] = useState<boolean>(false);
+  const [chartActive, setChartActive] = useState<boolean>(false);
+  const [chartTf, setChartTf] = useState<string>('M15');
+  const [chartPayload, setChartPayload] = useState<ChartPayload | null>(null);
+  const [chartCountdown, setChartCountdown] = useState<number>(60);
+  const chartSyncLockUntilRef = useRef<number>(0);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -99,6 +106,10 @@ export default function App() {
             if (st.gem_model) setGemModel(st.gem_model);
             if (st.claude_model) setClaudeModel(st.claude_model);
             if (st.tg_mode) setTgMode(st.tg_mode);
+            if (Date.now() > chartSyncLockUntilRef.current) {
+              if (typeof st.chart_active === 'boolean') setChartActive(st.chart_active);
+              if (st.chart_tf) setChartTf(st.chart_tf);
+            }
           }
         },
         (err) => setErrorMsg(err)
@@ -149,11 +160,43 @@ export default function App() {
         },
         (err) => setErrorMsg(err)
       ),
+      subscribeRoomItem(
+        roomId,
+        'chart',
+        (d) => {
+          if (d && typeof d.text === 'string' && d.text.trim()) {
+            try {
+              const parsed = JSON.parse(d.text) as ChartPayload;
+              if (Array.isArray(parsed.candles)) setChartPayload(parsed);
+            } catch {
+              // ignore malformed chart
+            }
+          }
+        },
+        (err) => setErrorMsg(err)
+      ),
     ];
     return () => {
       unsubs.forEach((u) => u());
     };
   }, [roomId]);
+
+  useEffect(() => {
+    if (!chartActive) {
+      setChartCountdown(60);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setChartCountdown((prev) => {
+        if (prev <= 1) {
+          void sendRoomCommand(roomId, 'chart_refresh', { tf: chartTf });
+          return 60;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [chartActive, chartTf, roomId]);
 
   const currentParams = () => ({
     symbol,
@@ -238,6 +281,15 @@ export default function App() {
               }`}
             >
               لوحة التحكم الحية
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('chart')}
+              className={`py-1 whitespace-nowrap shrink-0 transition-colors border-b-2 ${
+                activeTab === 'chart' ? 'text-slate-900 border-slate-900' : 'border-transparent hover:text-slate-900'
+              }`}
+            >
+              الرسم البياني المباشر
             </button>
             <button
               type="button"
@@ -663,6 +715,45 @@ export default function App() {
               </section>
             </div>
           </div>
+        )}
+
+        {/* TAB 1B: Live Interactive Chart */}
+        {activeTab === 'chart' && (
+          <LiveCandleChart
+            payload={chartPayload}
+            chartActive={chartActive}
+            selectedTf={chartTf}
+            countdownSec={chartCountdown}
+            timeframes={TF_LIST}
+            onStart={() => {
+              chartSyncLockUntilRef.current = Date.now() + 5000;
+              setChartActive(true);
+              setChartCountdown(60);
+              void dispatchCommand('chart_start', { tf: chartTf });
+            }}
+            onStop={() => {
+              chartSyncLockUntilRef.current = Date.now() + 5000;
+              setChartActive(false);
+              void dispatchCommand('chart_stop');
+            }}
+            onSelectTf={(tf) => {
+              chartSyncLockUntilRef.current = Date.now() + 5000;
+              setChartTf(tf);
+              setChartCountdown(60);
+              if (chartActive) {
+                void dispatchCommand('chart_tf', { tf });
+              } else {
+                setChartActive(true);
+                void dispatchCommand('chart_start', { tf });
+              }
+            }}
+            onRefreshNow={() => {
+              chartSyncLockUntilRef.current = Date.now() + 5000;
+              setChartCountdown(60);
+              if (!chartActive) setChartActive(true);
+              void dispatchCommand('chart_refresh', { tf: chartTf });
+            }}
+          />
         )}
 
         {/* TAB 2: Live Data & Generated File */}

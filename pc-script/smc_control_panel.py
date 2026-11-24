@@ -1167,6 +1167,7 @@ BRIDGE_HTTP_PORT = 8765
 BRIDGE_UDP_PORT = 8766
 BRIDGE_QUIET_SEC = 25
 BUSY_ACTIONS = ("connect", "fetch", "fetch_ai", "ai", "make_file", "tg_file")
+CHART_REMOTE_INTERVAL = 60.0
 LAST_REMOTE = [0.0]
 LAST_DIALOG = [""]
 
@@ -1456,6 +1457,7 @@ class Bridge:
                 "answer": self._c("SMC_answer.txt", a.last_answer),
                 "prompt": self._c("prompt.txt", a.prompt_text.get("1.0", "end").rstrip("\n")),
                 "lists": self._c("lists.json", json.dumps(lists, ensure_ascii=False)),
+                "chart": self._c("SMC_chart.json", a.chart_json),
             }
             try:
                 log_tail = a.log_box.get("end-41l", "end-1c")
@@ -1475,6 +1477,8 @@ class Bridge:
                 "claude_model": str(cfg["claude_model"])[:100],
                 "tg_mode": str(cfg["tg_mode"])[:30],
                 "label": str(a.last_label or "")[:120],
+                "chart_active": bool(a.chart_active),
+                "chart_tf": str(a.chart_tf or "M15")[:12],
                 "vers": {k: c["ver"] for k, c in contents.items()},
                 "log": log_tail.strip()[-3500:],
             }
@@ -1570,6 +1574,20 @@ class Bridge:
             a.refresh_models_async()
         elif action == "save":
             a.save_settings()
+        elif action == "chart_start":
+            tf = str(p.get("tf") or "").strip()
+            a.start_live_chart(tf=(tf if tf in TF_MAP else None), switch_tab=True, force_remote=True)
+        elif action == "chart_stop":
+            a.stop_live_chart()
+        elif action == "chart_tf":
+            tf = str(p.get("tf") or "").strip()
+            if tf in TF_MAP:
+                a.set_chart_timeframe(tf, force_remote=True)
+        elif action == "chart_refresh":
+            tf = str(p.get("tf") or "").strip()
+            if tf in TF_MAP:
+                a.chart_tf = tf
+            a.refresh_live_chart_once()
         else:
             return {"ok": False, "error": f"أمر غير معروف: {action}"}
         msg = LAST_DIALOG[0]
@@ -1680,6 +1698,8 @@ class Bridge:
                             "claude_model": str(snap.get("claude_model") or CLAUDE_DEFAULT_MODEL)[:100],
                             "tg_mode": str(snap.get("tg_mode") or "يدوي")[:30],
                             "label": str(snap.get("label") or "")[:120],
+                            "chart_active": bool(snap.get("chart_active")),
+                            "chart_tf": str(snap.get("chart_tf") or "M15")[:12],
                             "versJson": json.dumps(snap.get("vers") or {}, ensure_ascii=False)[:1000],
                             "log": str(snap.get("log") or "")[:5500],
                             "ts": int(time.time()),
@@ -1692,8 +1712,10 @@ class Bridge:
                             self._fb_check(self._fs_req("PATCH", f"rooms/{room}", fs_snap))
                             last_state_json, last_state_at = js, now
 
-                    # 3) رفع المحتويات والملفات عند تغيّر نسختها
+                    # 3) رفع المحتويات والملفات عند تغيّر نسختها (إيقاف رفع الرسم البياني عند إيقافه لتوفير الاستهلاك)
                     for k, c in list(self.contents.items()):
+                        if k == "chart" and not snap.get("chart_active"):
+                            continue
                         if c["ver"] and pushed.get(k) != c["ver"]:
                             item_doc = {
                                 "kind": k,
@@ -1726,6 +1748,8 @@ class Bridge:
                         self._fb_check(self._rtdb("PUT", room, "state", snap))
                         last_state_json, last_state_at = js, now
                     for k, c in list(self.contents.items()):
+                        if k == "chart" and not snap.get("chart_active"):
+                            continue
                         if c["ver"] and pushed.get(k) != c["ver"]:
                             self._fb_check(self._rtdb("PUT", room, f"content/{k}", c))
                             pushed[k] = c["ver"]
@@ -1770,10 +1794,28 @@ class App(tk.Tk):
         self.save_keys = tk.BooleanVar(value=False)
         self.br_fb_on = tk.BooleanVar(value=True)
         self.tf_vars = {n: tk.BooleanVar(value=(n != "D1")) for n in TF_MAP}
+        self.chart_active = False
+        self.chart_tf = "M15"
+        self.chart_candles = []
+        self.chart_digits = 2
+        self.chart_bid = 0.0
+        self.chart_ask = 0.0
+        self.chart_updated = ""
+        self.chart_json = ""
+        self.chart_last_push = 0.0
+        self.chart_view_offset = 0
+        self.chart_candle_w = 10.0
+        self.chart_drag_x = None
+        self.chart_drag_offset = 0
+        self.chart_crosshair = None
+        self.chart_stop_ev = threading.Event()
+        self.chart_wake_ev = threading.Event()
+        self.chart_push_remote_ev = threading.Event()
         self._build_ui()
         self._load_settings()
         self.bridge = Bridge(self)
         self.after(900, self.bridge.start)
+        threading.Thread(target=self._chart_worker_loop, daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._poll)
         self.after(1800, lambda: self.refresh_models_async(True))
@@ -1865,8 +1907,9 @@ class App(tk.Tk):
         share_menu.add_command(label="💾 إنشاء ملف وحفظه في الجهاز...", command=self.save_file_to_device)
         self.b_share["menu"] = share_menu
         self.b_stop = ttk.Button(bf, text="⏹ إيقاف", command=self.stop_ai, state="disabled")
-        for b in (self.b_fetch, self.b_gem, self.b_all, self.b_tg, self.b_tgfile, self.b_share, self.b_stop):
-            b.pack(side="left", padx=5)
+        self.b_chart = ttk.Button(bf, text="📈 عرض الرسم البياني", command=lambda: self.start_live_chart(switch_tab=True, force_remote=True))
+        for b in (self.b_fetch, self.b_gem, self.b_all, self.b_tg, self.b_tgfile, self.b_share, self.b_chart, self.b_stop):
+            b.pack(side="left", padx=4)
         self.action_buttons = [self.b_connect, self.b_fetch, self.b_gem, self.b_all, self.b_tg, self.b_tgfile,
                                self.b_share, self.b_models]
 
@@ -1906,6 +1949,7 @@ class App(tk.Tk):
         _, self.data_box = self._text_tab(self.nb, "البيانات المجلوبة")
         _, self.file_box = self._text_tab(self.nb, "الملف المُرسل (txt)")
         _, self.res_text = self._text_tab(self.nb, "نتيجة التحليل", font=("Segoe UI", 11))
+        self.chart_tab = self._build_chart_tab(self.nb)
         _, self.log_box = self._text_tab(self.nb, "السجل", font=("Consolas", 9))
         w = self.res_text
         w.tag_configure("rtl", justify="right")
@@ -2041,6 +2085,10 @@ class App(tk.Tk):
                 self._set_box(self.prompt_text, updated)
                 self.prompt_text.tag_add("rtl", "1.0", "end")
         self.prompt_symbol = sym
+        if getattr(self, "chart_active", False):
+            self.chart_view_offset = 0
+            self.chart_push_remote_ev.set()
+            self.chart_wake_ev.set()
 
     def _on_provider_change(self):
         prov = self.v["provider"].get()
@@ -2340,6 +2388,377 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------- Live Interactive Candlestick Chart ----------
+    def _build_chart_tab(self, nb):
+        fr = ttk.Frame(nb)
+        nb.add(fr, text="📈 الرسم البياني المباشر")
+
+        tb = tk.Frame(fr, bg="#0f172a", padx=8, pady=6)
+        tb.pack(fill="x")
+
+        self.btn_chart_start = tk.Button(
+            tb, text="📈 عرض الرسم البياني", bg="#059669", fg="#ffffff",
+            relief="flat", padx=10, pady=4, font=("Segoe UI", 9, "bold"),
+            command=lambda: self.start_live_chart(switch_tab=False, force_remote=True)
+        )
+        self.btn_chart_start.pack(side="left", padx=3)
+
+        self.btn_chart_stop = tk.Button(
+            tb, text="⏹ إيقاف العرض", bg="#dc2626", fg="#ffffff",
+            relief="flat", padx=10, pady=4, font=("Segoe UI", 9, "bold"),
+            state="disabled", command=self.stop_live_chart
+        )
+        self.btn_chart_stop.pack(side="left", padx=3)
+
+        tk.Frame(tb, width=1, bg="#334155").pack(side="left", fill="y", padx=6)
+
+        self.chart_tf_btns = {}
+        for tf_name in TF_MAP:
+            b = tk.Button(
+                tb, text=tf_name, bg="#1e293b", fg="#cbd5e1",
+                relief="flat", padx=8, pady=3, font=("Consolas", 9, "bold"),
+                command=lambda t=tf_name: self.set_chart_timeframe(t, force_remote=True)
+            )
+            b.pack(side="left", padx=2)
+            self.chart_tf_btns[tf_name] = b
+
+        tk.Frame(tb, width=1, bg="#334155").pack(side="left", fill="y", padx=6)
+
+        for lbl, cmd in (
+            ("🔍+", lambda: self._chart_zoom(1.25)),
+            ("🔍-", lambda: self._chart_zoom(0.8)),
+            ("↺ أحدث شمعة", self._chart_reset_view),
+        ):
+            tk.Button(
+                tb, text=lbl, bg="#1e293b", fg="#e2e8f0",
+                relief="flat", padx=8, pady=3, font=("Segoe UI", 9),
+                command=cmd
+            ).pack(side="left", padx=2)
+
+        self.lbl_chart_state = tk.Label(
+            tb, text="⏹ متوقف", bg="#0f172a", fg="#94a3b8", font=("Segoe UI", 9, "bold")
+        )
+        self.lbl_chart_state.pack(side="right", padx=8)
+
+        hud = tk.Frame(fr, bg="#111827", padx=10, pady=4)
+        hud.pack(fill="x")
+        self.lbl_chart_hud = tk.Label(
+            hud,
+            text="اضغط 'عرض الرسم البياني' لنقل الشموع الحية من MT5 مباشرة — اسحب للتحريك، وبكرة الفأرة للتكبير/التصغير",
+            bg="#111827", fg="#38bdf8", font=("Consolas", 9), anchor="w"
+        )
+        self.lbl_chart_hud.pack(fill="x")
+
+        self.chart_canvas = tk.Canvas(fr, bg="#0b1220", highlightthickness=0, cursor="crosshair")
+        self.chart_canvas.pack(fill="both", expand=True)
+        self.chart_canvas.bind("<Configure>", lambda e: self._draw_chart())
+        self.chart_canvas.bind("<ButtonPress-1>", self._on_chart_press)
+        self.chart_canvas.bind("<B1-Motion>", self._on_chart_drag)
+        self.chart_canvas.bind("<ButtonRelease-1>", self._on_chart_release)
+        self.chart_canvas.bind("<Motion>", self._on_chart_motion)
+        self.chart_canvas.bind("<Leave>", self._on_chart_leave)
+        self.chart_canvas.bind("<MouseWheel>", self._on_chart_wheel)
+        self.chart_canvas.bind("<Button-4>", lambda e: self._chart_zoom(1.18))
+        self.chart_canvas.bind("<Button-5>", lambda e: self._chart_zoom(0.85))
+        self._update_chart_tf_buttons()
+        return fr
+
+    def _update_chart_tf_buttons(self):
+        if not hasattr(self, "chart_tf_btns"):
+            return
+        for tf_name, btn in self.chart_tf_btns.items():
+            active = (tf_name == self.chart_tf)
+            btn.config(
+                bg=("#0284c7" if active else "#1e293b"),
+                fg=("#ffffff" if active else "#cbd5e1"),
+            )
+        if hasattr(self, "btn_chart_start"):
+            self.btn_chart_start.config(state=("disabled" if self.chart_active else "normal"))
+            self.btn_chart_stop.config(state=("normal" if self.chart_active else "disabled"))
+            if self.chart_active:
+                sym = self.v["symbol"].get().strip() or SYMBOL
+                self.lbl_chart_state.config(
+                    text=f"🟢 مباشر • {sym} • {self.chart_tf}", fg="#34d399"
+                )
+            else:
+                self.lbl_chart_state.config(text="⏹ متوقف (توفير الاستهلاك)", fg="#94a3b8")
+
+    def start_live_chart(self, tf=None, switch_tab=False, force_remote=True):
+        if tf and tf in TF_MAP:
+            self.chart_tf = tf
+        self.chart_active = True
+        self.chart_view_offset = 0
+        if force_remote:
+            self.chart_push_remote_ev.set()
+        self.chart_wake_ev.set()
+        self._update_chart_tf_buttons()
+        if switch_tab and hasattr(self, "chart_tab"):
+            self.nb.select(self.chart_tab)
+        self.lbl_status.config(text=f"📈 تم تشغيل الرسم البياني المباشر ({self.chart_tf})")
+        info_ar(f"📈 بدء عرض الرسم البياني المباشر ({self.v['symbol'].get().strip() or SYMBOL} / {self.chart_tf})")
+
+    def stop_live_chart(self):
+        self.chart_active = False
+        self.chart_wake_ev.set()
+        self._update_chart_tf_buttons()
+        self.lbl_status.config(text="⏹ تم إيقاف الرسم البياني وتوفير الاستهلاك")
+        info_ar("⏹ تم إيقاف نقل وعرض الرسم البياني")
+
+    def set_chart_timeframe(self, tf, force_remote=True):
+        if tf not in TF_MAP:
+            return
+        self.chart_tf = tf
+        self.chart_view_offset = 0
+        self._update_chart_tf_buttons()
+        if self.chart_active:
+            if force_remote:
+                self.chart_push_remote_ev.set()
+            self.chart_wake_ev.set()
+        else:
+            self.start_live_chart(tf=tf, switch_tab=False, force_remote=force_remote)
+
+    def refresh_live_chart_once(self):
+        self.chart_push_remote_ev.set()
+        if not self.chart_active:
+            self.start_live_chart(switch_tab=False, force_remote=True)
+        else:
+            self.chart_wake_ev.set()
+
+    def _chart_zoom(self, factor):
+        self.chart_candle_w = max(4.0, min(38.0, self.chart_candle_w * factor))
+        self._draw_chart()
+
+    def _chart_reset_view(self):
+        self.chart_view_offset = 0
+        self.chart_candle_w = 10.0
+        self._draw_chart()
+
+    def _on_chart_press(self, event):
+        self.chart_drag_x = event.x
+        self.chart_drag_offset = self.chart_view_offset
+
+    def _on_chart_drag(self, event):
+        if self.chart_drag_x is None or not self.chart_candles:
+            return
+        dx = event.x - self.chart_drag_x
+        shift = int(round(dx / max(4.0, self.chart_candle_w)))
+        max_off = max(0, len(self.chart_candles) - 8)
+        self.chart_view_offset = max(0, min(max_off, self.chart_drag_offset + shift))
+        self.chart_crosshair = (event.x, event.y)
+        self._draw_chart()
+
+    def _on_chart_release(self, event):
+        self.chart_drag_x = None
+
+    def _on_chart_motion(self, event):
+        self.chart_crosshair = (event.x, event.y)
+        self._draw_chart()
+
+    def _on_chart_leave(self, event):
+        self.chart_crosshair = None
+        self._draw_chart()
+
+    def _on_chart_wheel(self, event):
+        factor = 1.18 if getattr(event, "delta", 0) > 0 else 0.85
+        self._chart_zoom(factor)
+
+    def _chart_worker_loop(self):
+        while not self.chart_stop_ev.is_set():
+            if not self.chart_active:
+                self.chart_wake_ev.wait(0.8)
+                self.chart_wake_ev.clear()
+                continue
+            self.chart_wake_ev.clear()
+            sym = (self.v["symbol"].get().strip() or SYMBOL)
+            tf_name = self.chart_tf if self.chart_tf in TF_MAP else "M15"
+            acquired = self.mt5_lock.acquire(timeout=0.35)
+            if acquired:
+                try:
+                    if not self.mt5_ok:
+                        mt5.initialize()
+                    mt5.symbol_select(sym, True)
+                    rates = mt5.copy_rates_from_pos(sym, TF_MAP[tf_name], 0, 260)
+                    info = mt5.symbol_info(sym)
+                    digits = int(getattr(info, "digits", 2) or 2) if info else (2 if ("XAU" in sym.upper() or "JPY" in sym.upper()) else 5)
+                    tick = mt5.symbol_info_tick(sym)
+                    bid = float(tick.bid) if tick else 0.0
+                    ask = float(tick.ask) if tick else 0.0
+                    if rates is not None and len(rates) > 0:
+                        candles = [
+                            [
+                                int(r["time"]),
+                                round(float(r["open"]), digits),
+                                round(float(r["high"]), digits),
+                                round(float(r["low"]), digits),
+                                round(float(r["close"]), digits),
+                                int(r["tick_volume"]),
+                            ]
+                            for r in rates
+                        ]
+                        if bid <= 0:
+                            bid = float(candles[-1][4])
+                        if ask <= 0:
+                            ask = bid
+                        now_str = datetime.now(SAUDI_TZ).strftime("%H:%M:%S")
+                        now_ts = time.time()
+                        force_push = self.chart_push_remote_ev.is_set()
+                        need_remote = force_push or (now_ts - self.chart_last_push >= CHART_REMOTE_INTERVAL) or (not self.chart_json)
+                        payload_json = self.chart_json
+                        if need_remote:
+                            self.chart_push_remote_ev.clear()
+                            self.chart_last_push = now_ts
+                            payload_json = json.dumps({
+                                "symbol": sym,
+                                "tf": tf_name,
+                                "digits": digits,
+                                "bid": round(bid, digits),
+                                "ask": round(ask, digits),
+                                "updated": now_str,
+                                "candles": candles[-180:],
+                            }, ensure_ascii=False, separators=(",", ":"))
+
+                        def apply_chart(c=candles, d=digits, b=bid, a=ask, u=now_str, pj=payload_json, tf_u=tf_name, s_u=sym, nr=need_remote):
+                            if not self.chart_active:
+                                return
+                            self.mt5_ok = True
+                            self.chart_candles = c
+                            self.chart_digits = d
+                            self.chart_bid = b
+                            self.chart_ask = a
+                            self.chart_updated = u
+                            if nr:
+                                self.chart_json = pj
+                            self.lbl_price.config(text=f"{s_u}: {b:.{d}f} / {a:.{d}f}")
+                            self._update_chart_tf_buttons()
+                            self._draw_chart()
+
+                        self.ui(apply_chart)
+                except Exception as e:
+                    logger.error("chart worker: %s", e)
+                finally:
+                    self.mt5_lock.release()
+            self.chart_wake_ev.wait(3.0)
+
+    def _draw_chart(self):
+        if not hasattr(self, "chart_canvas"):
+            return
+        cv = self.chart_canvas
+        w = max(1, cv.winfo_width())
+        h = max(1, cv.winfo_height())
+        cv.delete("all")
+
+        candles = self.chart_candles
+        if not candles:
+            cv.create_text(
+                w / 2, h / 2,
+                text="اضغط '📈 عرض الرسم البياني' لجلب وعرض الشموع المباشرة من MT5",
+                fill="#64748b", font=("Segoe UI", 12, "bold")
+            )
+            return
+
+        pad_l, pad_t, pad_r, pad_b = 14, 16, 78, 28
+        plot_w = max(40, w - pad_l - pad_r)
+        plot_h = max(40, h - pad_t - pad_b)
+        step = max(4.0, float(self.chart_candle_w))
+        visible_count = max(8, int(plot_w // step))
+
+        total = len(candles)
+        end_idx = max(1, total - int(self.chart_view_offset))
+        start_idx = max(0, end_idx - visible_count)
+        vis = candles[start_idx:end_idx]
+        if not vis:
+            return
+
+        hi = max(c[2] for c in vis)
+        lo = min(c[3] for c in vis)
+        if self.chart_bid > 0 and self.chart_view_offset == 0:
+            hi = max(hi, self.chart_bid)
+            lo = min(lo, self.chart_bid)
+        rng = hi - lo
+        if rng <= 0:
+            rng = max(abs(hi) * 0.001, 0.01)
+        pad_p = rng * 0.08
+        p_max = hi + pad_p
+        p_min = lo - pad_p
+        p_rng = max(1e-9, p_max - p_min)
+
+        def y_of(price):
+            return pad_t + (p_max - price) / p_rng * plot_h
+
+        digits = self.chart_digits
+
+        # Grid & Price Axis
+        for i in range(6):
+            frac = i / 5.0
+            yy = pad_t + frac * plot_h
+            pval = p_max - frac * p_rng
+            cv.create_line(pad_l, yy, w - pad_r, yy, fill="#1e293b", dash=(2, 4))
+            cv.create_text(w - pad_r + 6, yy, text=f"{pval:.{digits}f}", fill="#94a3b8",
+                           font=("Consolas", 8), anchor="w")
+
+        cv.create_line(w - pad_r, pad_t, w - pad_r, h - pad_b, fill="#334155")
+        cv.create_line(pad_l, h - pad_b, w - pad_r, h - pad_b, fill="#334155")
+
+        body_w = max(2.0, step * 0.66)
+        label_every = max(1, len(vis) // 6)
+        for i, c in enumerate(vis):
+            cx = pad_l + (i + 0.5) * step
+            if cx > w - pad_r - 2:
+                break
+            ts_sec, op, ch, cl, cc, vol = c
+            y_hi = y_of(ch)
+            y_lo = y_of(cl)
+            y_op = y_of(op)
+            y_cl = y_of(cc)
+            bull = cc >= op
+            col = "#10b981" if bull else "#ef4444"
+            cv.create_line(cx, y_hi, cx, y_lo, fill=col, width=1)
+            top_y = min(y_op, y_cl)
+            bot_y = max(y_op, y_cl)
+            if bot_y - top_y < 1.5:
+                bot_y = top_y + 1.5
+            cv.create_rectangle(cx - body_w / 2.0, top_y, cx + body_w / 2.0, bot_y,
+                                fill=col, outline=col)
+
+            if i % label_every == 0:
+                dt_lbl = datetime.fromtimestamp(ts_sec, tz=SAUDI_TZ).strftime(
+                    "%m-%d" if self.chart_tf in ("H4", "D1") else "%H:%M"
+                )
+                cv.create_line(cx, pad_t, cx, h - pad_b, fill="#141e33")
+                cv.create_text(cx, h - pad_b + 12, text=dt_lbl, fill="#94a3b8", font=("Consolas", 8))
+
+        # Live Bid Price Line
+        if self.chart_bid > 0 and p_min <= self.chart_bid <= p_max:
+            yb = y_of(self.chart_bid)
+            cv.create_line(pad_l, yb, w - pad_r, yb, fill="#38bdf8", dash=(4, 3), width=1)
+            cv.create_rectangle(w - pad_r + 2, yb - 9, w - 2, yb + 9, fill="#0284c7", outline="")
+            cv.create_text(w - pad_r + 6, yb, text=f"{self.chart_bid:.{digits}f}",
+                           fill="#ffffff", font=("Consolas", 8, "bold"), anchor="w")
+
+        # Crosshair & HUD
+        sel = vis[-1]
+        if self.chart_crosshair is not None:
+            mx, my = self.chart_crosshair
+            if pad_l <= mx <= w - pad_r and pad_t <= my <= h - pad_b:
+                idx = int((mx - pad_l) / step)
+                if 0 <= idx < len(vis):
+                    sel = vis[idx]
+                    sx = pad_l + (idx + 0.5) * step
+                    cv.create_line(sx, pad_t, sx, h - pad_b, fill="#475569", dash=(3, 3))
+                cv.create_line(pad_l, my, w - pad_r, my, fill="#475569", dash=(3, 3))
+                hp = p_max - ((my - pad_t) / plot_h) * p_rng
+                cv.create_rectangle(w - pad_r + 2, my - 8, w - 2, my + 8, fill="#334155", outline="")
+                cv.create_text(w - pad_r + 6, my, text=f"{hp:.{digits}f}",
+                               fill="#e2e8f0", font=("Consolas", 8), anchor="w")
+
+        sym = self.v["symbol"].get().strip() or SYMBOL
+        t_str = datetime.fromtimestamp(sel[0], tz=SAUDI_TZ).strftime("%Y-%m-%d %H:%M")
+        self.lbl_chart_hud.config(
+            text=(f"{sym} ({self.chart_tf})  |  {t_str}  |  "
+                  f"O:{sel[1]:.{digits}f}  H:{sel[2]:.{digits}f}  L:{sel[3]:.{digits}f}  C:{sel[4]:.{digits}f}  "
+                  f"Vol:{sel[5]}  |  Bid:{self.chart_bid:.{digits}f} / Ask:{self.chart_ask:.{digits}f}  ({self.chart_updated})")
+        )
+
     # ---------- Settings ----------
     def save_settings(self):
         c = self.cfg()
@@ -2357,6 +2776,7 @@ class App(tk.Tk):
             "br_fb_on": bool(self.br_fb_on.get()),
             "br_fb_url": c["br_fb_url"] or DEFAULT_FB_URL,
             "br_fb_secret": c["br_fb_secret"] or DEFAULT_FB_API_KEY,
+            "chart_tf": self.chart_tf,
         }
         if self.save_keys.get():
             for k in ("login", "password", "server", "gem_key", "claude_key", "tg_token", "tg_chat"):
@@ -2383,6 +2803,9 @@ class App(tk.Tk):
         self.v["br_fb_url"].set(d.get("br_fb_url") or DEFAULT_FB_URL)
         self.v["br_fb_secret"].set(d.get("br_fb_secret") or DEFAULT_FB_API_KEY)
         self.br_fb_on.set(bool(d.get("br_fb_on", True)))
+        if d.get("chart_tf") in TF_MAP:
+            self.chart_tf = d["chart_tf"]
+            self._update_chart_tf_buttons()
         self.chain.set(bool(d.get("chain", False)))
         self.save_keys.set(bool(d.get("save_keys", False)))
         for k in ("login", "password", "server", "gem_key", "claude_key", "tg_token", "tg_chat"):
@@ -2401,6 +2824,12 @@ class App(tk.Tk):
         self._on_provider_change()
 
     def on_close(self):
+        try:
+            self.chart_active = False
+            self.chart_stop_ev.set()
+            self.chart_wake_ev.set()
+        except Exception:
+            pass
         try:
             if self.cancel_token is not None:
                 self.cancel_token.cancel()

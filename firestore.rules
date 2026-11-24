@@ -34,7 +34,7 @@ service cloud.firestore {
     }
 
     function isValidItemId(itemId) {
-      return itemId in ['data', 'file', 'answer', 'prompt', 'lists', 'cmd', 'resp'];
+      return itemId in ['data', 'file', 'answer', 'prompt', 'lists', 'cmd', 'resp', 'chart'];
     }
 
     function isValidRoomState(data) {
@@ -42,7 +42,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ok', 'name', 'mt5', 'conn', 'busy', 'ai', 'status', 'price',
           'symbol', 'tfsJson', 'chain', 'provider', 'gem_model', 'claude_model',
-          'tg_mode', 'label', 'versJson', 'log', 'ts'
+          'tg_mode', 'label', 'versJson', 'log', 'chart_active', 'chart_tf', 'ts'
         ])
         && data.ok is number
         && data.name is string && data.name.size() <= 120
@@ -62,7 +62,9 @@ service cloud.firestore {
         && (!('tg_mode' in data) || (data.tg_mode is string && data.tg_mode.size() <= 30))
         && (!('label' in data) || (data.label is string && data.label.size() <= 120))
         && (!('versJson' in data) || (data.versJson is string && data.versJson.size() <= 1000))
-        && (!('log' in data) || (data.log is string && data.log.size() <= 6000));
+        && (!('log' in data) || (data.log is string && data.log.size() <= 6000))
+        && (!('chart_active' in data) || data.chart_active is bool)
+        && (!('chart_tf' in data) || (data.chart_tf is string && data.chart_tf.size() <= 12));
     }
 
     function isValidRoomItem(itemId, data) {

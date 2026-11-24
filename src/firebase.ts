@@ -114,6 +114,8 @@ export interface RoomState {
   claude_model: string;
   tg_mode: string;
   label: string;
+  chart_active?: boolean;
+  chart_tf?: string;
   vers: Record<string, number>;
   log: string;
   ts: number;
@@ -159,6 +161,8 @@ export function subscribeRoomState(
         claude_model: String(d.claude_model ?? 'claude-sonnet-5-5'),
         tg_mode: String(d.tg_mode ?? 'يدوي'),
         label: String(d.label ?? ''),
+        chart_active: Boolean(d.chart_active),
+        chart_tf: String(d.chart_tf ?? 'M15'),
         vers: safeParseJson<Record<string, number>>(d.versJson, {}),
         log: String(d.log ?? ''),
         ts: Number(d.ts ?? 0),
@@ -176,7 +180,7 @@ export function subscribeRoomState(
 
 export function subscribeRoomItem(
   roomId: string,
-  itemId: 'data' | 'file' | 'answer' | 'prompt' | 'lists' | 'resp',
+  itemId: 'data' | 'file' | 'answer' | 'prompt' | 'lists' | 'resp' | 'chart',
   onData: (item: Record<string, unknown> | null) => void,
   onErr: (msg: string) => void
 ): Unsubscribe {

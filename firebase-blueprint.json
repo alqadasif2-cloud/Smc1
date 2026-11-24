@@ -23,18 +23,20 @@
         "label": { "type": "string", "maxLength": 120, "description": "Active analysis label" },
         "versJson": { "type": "string", "maxLength": 1000, "description": "JSON map of content versions" },
         "log": { "type": "string", "maxLength": 6000, "description": "Tail of PC execution log" },
+        "chart_active": { "type": "boolean", "description": "Whether live chart streaming is active" },
+        "chart_tf": { "type": "string", "maxLength": 12, "description": "Active chart timeframe" },
         "ts": { "type": "number", "description": "Unix timestamp in seconds" }
       },
       "required": ["ok", "name", "mt5", "busy", "ai", "symbol", "ts"]
     },
     "RoomItem": {
       "title": "RoomItem",
-      "description": "Synchronized payload item (data, file, answer, prompt, lists, cmd, resp) inside a paired room.",
+      "description": "Synchronized payload item (data, file, answer, prompt, lists, cmd, resp, chart) inside a paired room.",
       "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["data", "file", "answer", "prompt", "lists", "cmd", "resp"],
+          "enum": ["data", "file", "answer", "prompt", "lists", "cmd", "resp", "chart"],
           "maxLength": 20
         },
         "name": { "type": "string", "maxLength": 160 },
