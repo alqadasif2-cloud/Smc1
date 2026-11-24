@@ -84,6 +84,7 @@ DEFAULT_FB_PROJECT_ID = "gen-lang-client-0819396986"
 DEFAULT_FB_DATABASE_ID = "ai-studio-remotecontrolsyn-df2f1204-af22-4100-8861-97c8a605fa68"
 DEFAULT_FB_API_KEY = "AIzaSyCtdkKUAcEa5pZjKxxk1t9HayIq_Pi-ehw"
 DEFAULT_FB_URL = f"firestore://{DEFAULT_FB_PROJECT_ID}/{DEFAULT_FB_DATABASE_ID}"
+DEFAULT_PAIR_CODE = "SMC-AUTO-BRIDGE"
 
 # --------------------------
 # مزوّدو التحليل
@@ -1433,7 +1434,7 @@ class Bridge:
         try:
             cfg = a.cfg()
             if not norm_code(cfg.get("br_code")):
-                a.v["br_code"].set(new_pair_code())
+                a.v["br_code"].set(DEFAULT_PAIR_CODE)
                 cfg = a.cfg()
             self.code_norm = norm_code(cfg["br_code"])
             self.fb_on = bool(a.br_fb_on.get())
@@ -2378,7 +2379,7 @@ class App(tk.Tk):
         self.v["gem_model"].set(d.get("gem_model") or GEMINI_DEFAULT_MODEL)
         self.v["claude_model"].set(d.get("claude_model") or CLAUDE_DEFAULT_MODEL)
         self.v["tg_mode"].set(d.get("tg_mode") if d.get("tg_mode") in ("يدوي", "تلقائي") else "يدوي")
-        self.v["br_code"].set(d.get("br_code") or new_pair_code())
+        self.v["br_code"].set(d.get("br_code") or DEFAULT_PAIR_CODE)
         self.v["br_fb_url"].set(d.get("br_fb_url") or DEFAULT_FB_URL)
         self.v["br_fb_secret"].set(d.get("br_fb_secret") or DEFAULT_FB_API_KEY)
         self.br_fb_on.set(bool(d.get("br_fb_on", True)))

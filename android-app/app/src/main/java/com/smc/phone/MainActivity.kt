@@ -59,6 +59,7 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_FB_DATABASE_ID = "ai-studio-remotecontrolsyn-df2f1204-af22-4100-8861-97c8a605fa68"
         private const val DEFAULT_FB_API_KEY = "AIzaSyCtdkKUAcEa5pZjKxxk1t9HayIq_Pi-ehw"
         private const val DEFAULT_FB_URL = "firestore://$DEFAULT_FB_PROJECT_ID/$DEFAULT_FB_DATABASE_ID"
+        private const val DEFAULT_PAIR_CODE = "SMC-AUTO-BRIDGE"
 
         private const val BRIDGE_UDP_PORT = 8766
         private const val PREFS_NAME = "smc_phone_prefs"
@@ -212,7 +213,7 @@ class MainActivity : AppCompatActivity() {
     // ==========================================================
     private fun loadPrefs() {
         val p = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        pairCode = p.getString("pair_code", "") ?: ""
+        pairCode = p.getString("pair_code", DEFAULT_PAIR_CODE)?.ifBlank { DEFAULT_PAIR_CODE } ?: DEFAULT_PAIR_CODE
         connModeIdx = p.getInt("conn_mode", 0).coerceIn(0, 2)
         fbUrl = p.getString("fb_url", DEFAULT_FB_URL)?.ifBlank { DEFAULT_FB_URL } ?: DEFAULT_FB_URL
         fbSecret = p.getString("fb_secret", DEFAULT_FB_API_KEY)?.ifBlank { DEFAULT_FB_API_KEY } ?: DEFAULT_FB_API_KEY
@@ -307,7 +308,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, dp(6), 0)
         }
         tvStatusBar = TextView(this).apply {
-            text = "أدخل رمز الربط أو انتظر المزامنة التلقائية عبر Firebase"
+            text = "متصل تلقائياً عبر Firebase / الشبكة المحلية — في انتظار السكربت على الكمبيوتر"
             setTextColor(Color.parseColor("#CBD5E1"))
             textSize = 12f
         }

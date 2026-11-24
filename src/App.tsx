@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { User } from 'firebase/auth';
 import {
   CheckCircle2,
   Cloud,
@@ -8,8 +7,6 @@ import {
   FileCode2,
   FileText,
   FolderArchive,
-  LogIn,
-  LogOut,
   Play,
   Plus,
   RefreshCw,
@@ -18,25 +15,17 @@ import {
   Send,
   Square,
   Terminal,
-  Trash2,
   Wifi,
   Zap,
 } from 'lucide-react';
 import {
+  DEFAULT_PAIR_CODE,
   FIREBASE_META,
-  normalizePairCode,
   pairCodeToRoomId,
-  removeRoomShortcut,
-  saveRoomShortcut,
   sendRoomCommand,
-  signInWithGoogle,
-  signOutUser,
-  subscribeAuth,
   subscribeRoomItem,
   subscribeRoomState,
-  subscribeSavedRooms,
   type RoomState,
-  type SavedRoomEntry,
 } from './firebase';
 import {
   downloadMainActivityKt,
@@ -53,7 +42,6 @@ const DEFAULT_PROVIDERS = ['Gemini', 'Claude (عبر API)', 'Claude Code (مبا
 const DEFAULT_GEM_MODELS = ['gemini-flash-latest', 'gemini-pro-latest', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash'];
 const DEFAULT_CLAUDE_MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-4-5'];
 const DEFAULT_TG_MODES = ['يدوي', 'تلقائي'];
-const STORAGE_PAIR_KEY = 'smc_pair_code_v1';
 
 interface ListsPayload {
   symbols?: string[];
@@ -66,12 +54,7 @@ interface ListsPayload {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('control');
-  const [user, setUser] = useState<User | null>(null);
-  const [savedRooms, setSavedRooms] = useState<SavedRoomEntry[]>([]);
-
-  const [pairInput, setPairInput] = useState<string>(() => localStorage.getItem(STORAGE_PAIR_KEY) || '');
-  const [activeCode, setActiveCode] = useState<string>(() => localStorage.getItem(STORAGE_PAIR_KEY) || '');
-  const [aliasInput, setAliasInput] = useState<string>('');
+  const roomId = useMemo(() => pairCodeToRoomId(DEFAULT_PAIR_CODE), []);
 
   const [roomState, setRoomState] = useState<RoomState | null>(null);
   const [dataItem, setDataItem] = useState<{ name: string; text: string; ver: number }>({ name: 'SMC_data.txt', text: '', ver: 0 });
@@ -81,7 +64,6 @@ export default function App() {
   const [lists, setLists] = useState<ListsPayload>({});
   const [selectedPreset, setSelectedPreset] = useState<string>('');
 
-  // Editable local mirror of settings before/while syncing
   const [symbol, setSymbol] = useState<string>('XAUUSD');
   const [tfs, setTfs] = useState<Record<string, boolean>>({
     M1: true, M5: true, M15: true, M30: true, H1: true, H4: true, D1: false,
@@ -97,38 +79,12 @@ export default function App() {
   const [isExportingZip, setIsExportingZip] = useState<boolean>(false);
   const [workflowRunning, setWorkflowRunning] = useState<boolean>(false);
 
-  const normalizedCode = useMemo(() => normalizePairCode(activeCode), [activeCode]);
-  const roomId = useMemo(() => (normalizedCode.length >= 12 ? pairCodeToRoomId(normalizedCode) : ''), [normalizedCode]);
-
   const showToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg((cur) => (cur === msg ? '' : cur)), 3500);
   };
 
-  // Auth subscription
   useEffect(() => {
-    return subscribeAuth((u) => setUser(u));
-  }, []);
-
-  // Saved rooms subscription
-  useEffect(() => {
-    if (!user) {
-      setSavedRooms([]);
-      return;
-    }
-    return subscribeSavedRooms(
-      user.uid,
-      (items) => setSavedRooms(items),
-      (err) => setErrorMsg(err)
-    );
-  }, [user]);
-
-  // Live Firestore room subscriptions
-  useEffect(() => {
-    if (!roomId) {
-      setRoomState(null);
-      return;
-    }
     setErrorMsg('');
     const unsubs = [
       subscribeRoomState(
@@ -209,34 +165,7 @@ export default function App() {
     tg_mode: tgMode,
   });
 
-  const handleApplyPairCode = () => {
-    const clean = normalizePairCode(pairInput);
-    if (clean.length < 12) {
-      setErrorMsg('رمز الربط يجب أن يكون 12 حرفاً/رقماً على الأقل (مثال: ABCD-EFGH-JKLM).');
-      return;
-    }
-    setErrorMsg('');
-    localStorage.setItem(STORAGE_PAIR_KEY, pairInput.trim().toUpperCase());
-    setActiveCode(pairInput.trim().toUpperCase());
-    showToast('تم تفعيل رمز الربط — جاري المزامنة عبر Firebase');
-  };
-
-  const handleSaveShortcut = async () => {
-    if (!user || !roomId) return;
-    try {
-      await saveRoomShortcut(user.uid, activeCode, aliasInput || roomState?.name || 'لوحة SMC');
-      setAliasInput('');
-      showToast('تم حفظ رمز الربط في حسابك');
-    } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   const dispatchCommand = async (action: string, params: Record<string, unknown> = {}) => {
-    if (!roomId) {
-      setErrorMsg('أدخل رمز الربط أولاً للاتصال بلوحة الكمبيوتر.');
-      return;
-    }
     setErrorMsg('');
     try {
       await sendRoomCommand(roomId, action, params);
@@ -247,14 +176,10 @@ export default function App() {
   };
 
   const runFetchCreateDownload = async () => {
-    if (!roomId) {
-      setErrorMsg('أدخل رمز الربط أولاً.');
-      return;
-    }
     setWorkflowRunning(true);
     try {
       await sendRoomCommand(roomId, 'fetch', currentParams());
-      showToast('1/3 تم طلب جلب البيانات الحية... انتظر اكتمال التحليل على الكمبيوتر ثم اضغط إنشاء ملف');
+      showToast('جاري جلب البيانات الحية وإنشاء الملف...');
       await new Promise((r) => setTimeout(r, 2500));
       await sendRoomCommand(roomId, 'make_file', currentParams());
       showToast('تم إرسال طلب جلب البيانات وإنشاء الملف — سيظهر الملف تلقائياً في تبويب البيانات والملف');
@@ -344,31 +269,19 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-3 shrink-0">
-            {user ? (
-              <button
-                type="button"
-                onClick={() => void signOutUser()}
-                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                <span>خروج ({user.displayName?.split(' ')[0] || user.email})</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => void signInWithGoogle()}
-                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-              >
-                <LogIn className="w-3.5 h-3.5" />
-                <span>تسجيل الدخول بـ Google</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={downloadPythonScript}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>تحميل ملف Python</span>
+            </button>
           </div>
         </div>
       </header>
 
       <main className="flex-1 max-w-[1320px] w-full mx-auto px-6 py-6 space-y-6">
-        {/* Notifications */}
         {(toastMsg || errorMsg) && (
           <div className="space-y-2">
             {toastMsg && (
@@ -390,15 +303,15 @@ export default function App() {
           </div>
         )}
 
-        {/* Pairing & Status Strip */}
+        {/* Direct Cloud Connection Strip (Zero Login / Zero Room Code) */}
         <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div className="space-y-1">
-              <h1 className="text-lg font-bold text-slate-900">مركز المزامنة السحابي (Firebase Firestore الافتراضي)</h1>
+              <h1 className="text-lg font-bold text-slate-900">اتصال مباشر تلقائي مع Firebase (بدون رمز غرفة أو تسجيل دخول)</h1>
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
                 <span>المشروع: <span className="font-mono-num text-slate-700">{FIREBASE_META.projectId}</span></span>
                 <span aria-hidden="true">·</span>
-                <span>الحالة: {roomId ? (isPcOnline ? 'اللوحة الأم متصلة' : 'في انتظار نبض اللوحة الأم') : 'بانتظار إدخال رمز الربط'}</span>
+                <span>حالة السكربت: {isPcOnline ? 'اللوحة الأم متصلة ومزامنة' : 'في انتظار تشغيل smc_control_panel.py على الكمبيوتر'}</span>
                 {roomState && (
                   <>
                     <span aria-hidden="true">·</span>
@@ -410,75 +323,19 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                type="text"
-                value={pairInput}
-                onChange={(e) => setPairInput(e.target.value)}
-                placeholder="رمز الربط: ABCD-EFGH-JKLM"
-                className="font-mono-num text-sm px-3 py-2 border border-slate-300 rounded-lg bg-slate-50 focus:outline-none focus:ring-2 focus:ring-slate-900 w-56 text-left"
-                dir="ltr"
-              />
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={handleApplyPairCode}
-                className="px-4 py-2 text-sm font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                onClick={() => void handleZipDownload()}
+                disabled={isExportingZip}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 transition-colors whitespace-nowrap shrink-0"
               >
-                ربط الغرفة
+                <FolderArchive className="w-3.5 h-3.5" />
+                <span>{isExportingZip ? 'جاري التجهيز...' : 'تحميل مشروع APK لـ GitHub'}</span>
               </button>
-              {user && roomId && (
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={aliasInput}
-                    onChange={(e) => setAliasInput(e.target.value)}
-                    placeholder="اسم الجهاز للحفظ"
-                    className="text-sm px-3 py-2 border border-slate-300 rounded-lg bg-white w-36"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleSaveShortcut()}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
-                  >
-                    <Save className="w-3.5 h-3.5" />
-                    <span>حفظ</span>
-                  </button>
-                </div>
-              )}
             </div>
           </div>
 
-          {/* Saved Shortcuts when signed in */}
-          {user && savedRooms.length > 0 && (
-            <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center gap-2">
-              <span className="text-xs text-slate-500">الأجهزة المحفوظة:</span>
-              {savedRooms.map((item) => (
-                <div key={item.roomId} className="inline-flex items-center border border-slate-200 rounded-lg bg-slate-50 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPairInput(item.pairCode);
-                      setActiveCode(item.pairCode);
-                      localStorage.setItem(STORAGE_PAIR_KEY, item.pairCode);
-                    }}
-                    className="px-3 py-1.5 font-medium text-slate-800 hover:text-slate-950"
-                  >
-                    {item.alias} ({item.pairCode})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void removeRoomShortcut(user.uid, item.roomId)}
-                    className="px-2 py-1.5 text-slate-400 hover:text-rose-600 border-r border-slate-200"
-                    title="حذف"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Live Price & Status Bar */}
           {roomState && (
             <div className="pt-3 border-t border-slate-100 grid grid-cols-1 md:grid-cols-4 gap-4 text-sm">
               <div>
@@ -501,7 +358,6 @@ export default function App() {
         {activeTab === 'control' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <div className="lg:col-span-7 space-y-6">
-              {/* MT5 & Timeframes & AI Provider */}
               <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-5">
                 <div className="flex items-center justify-between">
                   <h2 className="text-base font-bold text-slate-900">إعدادات المنصة والفريمات والمزوّد</h2>
@@ -647,7 +503,6 @@ export default function App() {
                 </div>
               </section>
 
-              {/* All Action Buttons */}
               <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
                 <h2 className="text-base font-bold text-slate-900">أزرار التحكم والتنفيذ</h2>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -736,7 +591,6 @@ export default function App() {
               </section>
             </div>
 
-            {/* Prompts & Live Log */}
             <div className="lg:col-span-5 space-y-6">
               <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
                 <div className="flex items-center justify-between">
@@ -911,11 +765,10 @@ export default function App() {
           </section>
         )}
 
-        {/* TAB 4: Export Studio (Python + Single-File Android + GitHub Actions ZIP) */}
+        {/* TAB 4: Export Studio */}
         {activeTab === 'export' && (
           <div className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {/* Card 1: Single-file Python */}
               <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-slate-900 font-bold text-base">
@@ -924,28 +777,37 @@ export default function App() {
                   </div>
                   <p className="text-sm text-slate-600 leading-6">
                     سكربت <span className="font-mono-num">smc_control_panel.py</span> كامل في ملف واحد ({EXPORT_PREVIEWS.pythonLines} سطراً)،
-                    مربوط افتراضياً بقاعدة Firebase Firestore الحالية + خادم محلي HTTP/UDP.
+                    يتصل مباشرة بـ Firebase بدون إدخال أي رمز غرفة.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={downloadPythonScript}
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>تحميل smc_control_panel.py</span>
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={downloadPythonScript}
+                    className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>تحميل .py</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopy(EXPORT_PREVIEWS.pythonRaw, 'كود Python')}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 text-sm font-medium border border-slate-300 text-slate-900 rounded-lg hover:bg-slate-50 transition-colors"
+                  >
+                    <Copy className="w-4 h-4" />
+                    <span>نسخ</span>
+                  </button>
+                </div>
               </div>
 
-              {/* Card 2: Complete GitHub APK ZIP */}
               <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-slate-900 font-bold text-base">
                     <FolderArchive className="w-5 h-5 text-emerald-700" />
-                    <span>مشروع APK كامل لـ GitHub</span>
+                    <span>مشروع GitHub الكامل (APK + Python)</span>
                   </div>
                   <p className="text-sm text-slate-600 leading-6">
-                    حزمة Gradle + Kotlin + <span className="font-mono-num">.github/workflows/build-apk.yml</span> جاهزة للرفع إلى GitHub وبناء ملف APK عبر Actions بدون أي أخطاء.
+                    حزمة جاهزة للرفع إلى GitHub تحتوي على مشروع Android APK + <span className="font-mono-num">.github/workflows/build-apk.yml</span> + ملف Python.
                   </p>
                 </div>
                 <button
@@ -959,7 +821,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Card 3: Single-file Kotlin */}
               <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-slate-900 font-bold text-base">
@@ -967,7 +828,7 @@ export default function App() {
                     <span>كود الهاتف في ملف واحد</span>
                   </div>
                   <p className="text-sm text-slate-600 leading-6">
-                    ملف <span className="font-mono-num">MainActivity.kt</span> ({EXPORT_PREVIEWS.kotlinLines} سطراً) يحتوي على كل واجهة الأندرويد والأزرار والربط التلقائي بين Wi-Fi و Firebase.
+                    ملف <span className="font-mono-num">MainActivity.kt</span> ({EXPORT_PREVIEWS.kotlinLines} سطراً) يتصل تلقائياً عبر الشبكة المحلية أو Firebase بدون أي رمز أو تسجيل دخول.
                   </p>
                 </div>
                 <button
@@ -981,29 +842,28 @@ export default function App() {
               </div>
             </div>
 
-            {/* Pre-wired Firebase & Steps */}
             <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
                 <Cloud className="w-5 h-5 text-slate-700" />
-                <span>خطوات التشغيل وتحويل APK عبر GitHub Actions</span>
+                <span>الربط السحابي المباشر (مفعل افتراضياً بدون تسجيل دخول)</span>
               </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm text-slate-700 leading-7">
                 <ol className="list-decimal list-inside space-y-2">
-                  <li>حمّل <span className="font-mono-num font-semibold">smc_control_panel.py</span> وشغّله على الكمبيوتر: <code className="font-mono-num bg-slate-100 px-1.5 py-0.5 rounded">python smc_control_panel.py</code> (Firebase مفعّل ومربوط افتراضياً في القسم 4).</li>
-                  <li>حمّل <span className="font-mono-num font-semibold">SMC-Phone-GitHub-APK.zip</span> وفك ضغطه، ثم ارفع الملفات إلى مستودع GitHub جديد (أو ادفع هذا المستودع مباشرة إلى GitHub).</li>
-                  <li>من تبويب <strong>Actions</strong> في GitHub، سيشتغل مسار <strong>Build SMC Phone APK</strong> تلقائياً وينتج ملف <span className="font-mono-num">app-debug.apk</span> في قسم Artifacts.</li>
-                  <li>ثبّت الـ APK على هاتفك وأدخل <strong>رمز الربط</strong> الظاهر في القسم 4 من لوحة الكمبيوتر — يتعرف التطبيق تلقائياً على الشبكة المحلية أو يستخدم Firebase.</li>
+                  <li>حمّل <span className="font-mono-num font-semibold">smc_control_panel.py</span> وشغّله على الكمبيوتر: <code className="font-mono-num bg-slate-100 px-1.5 py-0.5 rounded">python smc_control_panel.py</code> — سيتصل مباشرة بـ Firebase.</li>
+                  <li>حمّل <span className="font-mono-num font-semibold">SMC-Phone-GitHub-APK.zip</span> وفك ضغطه ثم ارفع المحتويات إلى GitHub (يحتوي على مسار Actions لبناء الـ APK + ملف Python).</li>
+                  <li>افتح تبويب <strong>Actions</strong> في GitHub وحمّل <span className="font-mono-num">app-debug.apk</span> بعد انتهاء البناء.</li>
+                  <li>افتح التطبيق على هاتفك: سيتعرف تلقائياً على الشبكة المحلية أو يتصل مباشرة بـ Firebase فوراً بدون كتابة أي رمز.</li>
                 </ol>
 
                 <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 space-y-2 text-xs font-mono-num" dir="ltr">
                   <div className="font-semibold text-slate-900 flex items-center gap-1.5">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    <span>Pre-wired Firebase Firestore Defaults</span>
+                    <span>Zero-Config Direct Cloud Sync</span>
                   </div>
                   <div>Project ID: {FIREBASE_META.projectId}</div>
                   <div>Database ID: {FIREBASE_META.databaseId}</div>
-                  <div>Local Bridge: HTTP :8765 + UDP Discovery :8766</div>
-                  <div>Android Output: Downloads/SMC/*.txt</div>
+                  <div>Auto Channel: {DEFAULT_PAIR_CODE}</div>
+                  <div>Local Bridge: HTTP :8765 + UDP :8766</div>
                 </div>
               </div>
             </section>

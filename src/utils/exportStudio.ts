@@ -96,6 +96,7 @@ export async function downloadAndroidGitHubZip(): Promise<void> {
   const zip = new JSZip();
   zip.file('.github/workflows/build-apk.yml', STANDALONE_WORKFLOW_YML);
   zip.file('README.md', STANDALONE_README);
+  zip.file('pc-script/smc_control_panel.py', pythonPanelRaw);
   zip.file('settings.gradle.kts', androidSettingsRaw);
   zip.file('build.gradle.kts', androidRootBuildRaw);
   zip.file('gradle.properties', androidGradlePropsRaw);

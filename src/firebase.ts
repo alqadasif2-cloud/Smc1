@@ -1,21 +1,11 @@
 import { initializeApp } from 'firebase/app';
-import {
-  getAuth,
-  GoogleAuthProvider,
-  signInWithPopup,
-  signOut,
-  onAuthStateChanged,
-  type User,
-} from 'firebase/auth';
+import { getAuth } from 'firebase/auth';
 import {
   getFirestore,
   doc,
   getDocFromServer,
   setDoc,
-  deleteDoc,
   onSnapshot,
-  collection,
-  query,
   type Unsubscribe,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
@@ -23,7 +13,8 @@ import firebaseConfig from '../firebase-applet-config.json';
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
+
+export const DEFAULT_PAIR_CODE = 'SMC-AUTO-BRIDGE';
 
 export const FIREBASE_META = {
   projectId: firebaseConfig.projectId,
@@ -85,7 +76,7 @@ export function handleFirestoreError(
 
 export async function testConnection(): Promise<boolean> {
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    await getDocFromServer(doc(db, 'rooms', pairCodeToRoomId(DEFAULT_PAIR_CODE)));
     return true;
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
@@ -104,35 +95,6 @@ export function normalizePairCode(code: string): string {
 
 export function pairCodeToRoomId(code: string): string {
   return normalizePairCode(code).toLowerCase();
-}
-
-export async function signInWithGoogle(): Promise<User> {
-  const res = await signInWithPopup(auth, googleProvider);
-  const u = res.user;
-  const userPath = `users/${u.uid}`;
-  try {
-    await setDoc(
-      doc(db, 'users', u.uid),
-      {
-        uid: u.uid,
-        displayName: (u.displayName || '').slice(0, 120),
-        email: (u.email || '').slice(0, 180),
-        updatedAt: Math.floor(Date.now() / 1000),
-      },
-      { merge: true }
-    );
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, userPath);
-  }
-  return u;
-}
-
-export async function signOutUser(): Promise<void> {
-  await signOut(auth);
-}
-
-export function subscribeAuth(cb: (user: User | null) => void): Unsubscribe {
-  return onAuthStateChanged(auth, cb);
 }
 
 export interface RoomState {
@@ -155,22 +117,6 @@ export interface RoomState {
   vers: Record<string, number>;
   log: string;
   ts: number;
-}
-
-export interface RoomContentItem {
-  kind: string;
-  name: string;
-  text: string;
-  ver: number;
-  ts: number;
-}
-
-export interface SavedRoomEntry {
-  ownerId: string;
-  roomId: string;
-  pairCode: string;
-  alias: string;
-  updatedAt: number;
 }
 
 function safeParseJson<T>(raw: unknown, fallback: T): T {
@@ -268,65 +214,5 @@ export async function sendRoomCommand(
     return cmdId;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
-  }
-}
-
-export function subscribeSavedRooms(
-  userId: string,
-  onData: (rooms: SavedRoomEntry[]) => void,
-  onErr: (msg: string) => void
-): Unsubscribe {
-  const path = `users/${userId}/savedRooms`;
-  return onSnapshot(
-    query(collection(db, 'users', userId, 'savedRooms')),
-    (snap) => {
-      const list: SavedRoomEntry[] = snap.docs.map((d) => {
-        const data = d.data();
-        return {
-          ownerId: String(data.ownerId ?? userId),
-          roomId: String(data.roomId ?? d.id),
-          pairCode: String(data.pairCode ?? ''),
-          alias: String(data.alias ?? ''),
-          updatedAt: Number(data.updatedAt ?? 0),
-        };
-      });
-      onData(list.sort((a, b) => b.updatedAt - a.updatedAt));
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch (e) {
-        onErr(e instanceof Error ? e.message : String(e));
-      }
-    }
-  );
-}
-
-export async function saveRoomShortcut(
-  userId: string,
-  pairCode: string,
-  alias: string
-): Promise<void> {
-  const roomId = pairCodeToRoomId(pairCode);
-  const path = `users/${userId}/savedRooms/${roomId}`;
-  try {
-    await setDoc(doc(db, 'users', userId, 'savedRooms', roomId), {
-      ownerId: userId,
-      roomId,
-      pairCode: pairCode.trim().toUpperCase().slice(0, 32),
-      alias: alias.trim().slice(0, 80) || 'جهاز التداول الرئيسي',
-      updatedAt: Math.floor(Date.now() / 1000),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
-}
-
-export async function removeRoomShortcut(userId: string, roomId: string): Promise<void> {
-  const path = `users/${userId}/savedRooms/${roomId}`;
-  try {
-    await deleteDoc(doc(db, 'users', userId, 'savedRooms', roomId));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
