@@ -180,7 +180,7 @@ export function subscribeRoomState(
 
 export function subscribeRoomItem(
   roomId: string,
-  itemId: 'data' | 'file' | 'answer' | 'prompt' | 'lists' | 'resp' | 'chart',
+  itemId: 'data' | 'file' | 'answer' | 'prompt' | 'lists' | 'resp' | 'chart' | 'cmd',
   onData: (item: Record<string, unknown> | null) => void,
   onErr: (msg: string) => void
 ): Unsubscribe {
@@ -198,6 +198,57 @@ export function subscribeRoomItem(
       }
     }
   );
+}
+
+function hashTextVer(text: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h & 0x7fffffff) || 1;
+}
+
+export async function publishRoomAnswer(
+  roomId: string,
+  answerText: string,
+  name = 'SMC_gemini_answer.txt'
+): Promise<void> {
+  const path = `rooms/${roomId}/items/answer`;
+  try {
+    const clipped = answerText.slice(0, 700000);
+    await setDoc(doc(db, 'rooms', roomId, 'items', 'answer'), {
+      kind: 'answer',
+      name: name.slice(0, 160),
+      text: clipped,
+      ver: hashTextVer(clipped),
+      ts: Math.floor(Date.now() / 1000),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function publishRoomResp(
+  roomId: string,
+  cmdId: string,
+  ok: boolean,
+  errorMsg = ''
+): Promise<void> {
+  const path = `rooms/${roomId}/items/resp`;
+  try {
+    await setDoc(doc(db, 'rooms', roomId, 'items', 'resp'), {
+      kind: 'resp',
+      id: cmdId.slice(0, 80),
+      ok,
+      error: errorMsg.slice(0, 1200),
+      name: 'SMC_gemini_answer.txt',
+      file_ver: 0,
+      ts: Math.floor(Date.now() / 1000),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
 }
 
 export async function sendRoomCommand(

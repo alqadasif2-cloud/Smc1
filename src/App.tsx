@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Save,
   Send,
+  Sparkles,
   Square,
   Terminal,
   Wifi,
@@ -22,6 +23,8 @@ import {
   DEFAULT_PAIR_CODE,
   FIREBASE_META,
   pairCodeToRoomId,
+  publishRoomAnswer,
+  publishRoomResp,
   sendRoomCommand,
   subscribeRoomItem,
   subscribeRoomState,
@@ -80,11 +83,32 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [isExportingZip, setIsExportingZip] = useState<boolean>(false);
   const [workflowRunning, setWorkflowRunning] = useState<boolean>(false);
+  const [internalGeminiLoading, setInternalGeminiLoading] = useState<boolean>(false);
+  const [internalGeminiLabel, setInternalGeminiLabel] = useState<string>('');
   const [chartActive, setChartActive] = useState<boolean>(false);
   const [chartTf, setChartTf] = useState<string>('M15');
   const [chartPayload, setChartPayload] = useState<ChartPayload | null>(null);
   const [chartCountdown, setChartCountdown] = useState<number>(60);
   const chartSyncLockUntilRef = useRef<number>(0);
+
+  const fileItemRef = useRef(fileItem);
+  const dataItemRef = useRef(dataItem);
+  const promptDraftRef = useRef(promptDraft);
+  const symbolRef = useRef(symbol);
+  const handledRemoteGeminiCmdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    fileItemRef.current = fileItem;
+  }, [fileItem]);
+  useEffect(() => {
+    dataItemRef.current = dataItem;
+  }, [dataItem]);
+  useEffect(() => {
+    promptDraftRef.current = promptDraft;
+  }, [promptDraft]);
+  useEffect(() => {
+    symbolRef.current = symbol;
+  }, [symbol]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -175,6 +199,25 @@ export default function App() {
         },
         (err) => setErrorMsg(err)
       ),
+      subscribeRoomItem(
+        roomId,
+        'cmd',
+        (d) => {
+          if (!d) return;
+          const cmdId = String(d.id ?? '');
+          const act = String(d.action ?? '');
+          if (handledRemoteGeminiCmdRef.current === null) {
+            handledRemoteGeminiCmdRef.current = cmdId;
+            return;
+          }
+          if (!cmdId || cmdId === handledRemoteGeminiCmdRef.current) return;
+          if (act === 'internal_gemini' || act === 'make_file_internal_gemini') {
+            handledRemoteGeminiCmdRef.current = cmdId;
+            void handleRemotePhoneGeminiCommand(cmdId, act);
+          }
+        },
+        (err) => setErrorMsg(err)
+      ),
     ];
     return () => {
       unsubs.forEach((u) => u());
@@ -215,6 +258,116 @@ export default function App() {
       if (action !== 'set') showToast(`تم إرسال الأمر (${action}) عبر Firebase`);
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const callInternalGemini = async (contentText: string, sym: string, promptText = '') => {
+    const resp = await fetch('/api/gemini/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: contentText,
+        symbol: sym,
+        prompt: promptText,
+        roomId,
+        pushToFirebase: false,
+      }),
+    });
+    const data = (await resp.json().catch(() => ({}))) as {
+      ok?: boolean;
+      answer?: string;
+      label?: string;
+      error?: string;
+    };
+    if (!resp.ok || !data.ok || !data.answer) {
+      throw new Error(data.error || `تعذر تحليل الملف عبر Gemini الداخلي (HTTP ${resp.status})`);
+    }
+    setAnswerItem({
+      name: 'SMC_gemini_answer.txt',
+      text: data.answer,
+      ver: Date.now(),
+    });
+    setInternalGeminiLabel(data.label || 'Gemini الداخلي (gemini-4-hydrogen)');
+    await publishRoomAnswer(roomId, data.answer, 'SMC_gemini_answer.txt');
+    return data.answer;
+  };
+
+  const handleRemotePhoneGeminiCommand = async (cmdId: string, act: string) => {
+    setInternalGeminiLoading(true);
+    try {
+      if (act === 'make_file_internal_gemini') {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      const textToAnalyze = fileItemRef.current.text.trim() || dataItemRef.current.text.trim();
+      if (!textToAnalyze) {
+        await publishRoomResp(roomId, cmdId, false, 'لا يوجد ملف أو بيانات للتحليل بعد — اجلب البيانات وأنشئ الملف أولاً.');
+        return;
+      }
+      await callInternalGemini(textToAnalyze, symbolRef.current || 'XAUUSD', promptDraftRef.current);
+      await publishRoomResp(roomId, cmdId, true);
+      showToast('✨ تم تحليل ملف الهاتف عبر جيمناي الداخلي وإرسال النتيجة إلى الهاتف');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await publishRoomResp(roomId, cmdId, false, msg);
+      setErrorMsg(msg);
+    } finally {
+      setInternalGeminiLoading(false);
+    }
+  };
+
+  const runAnalyzeCurrentWithInternalGemini = async () => {
+    setErrorMsg('');
+    const content = fileItem.text.trim() || dataItem.text.trim();
+    if (!content) {
+      setErrorMsg('لا يوجد ملف أو بيانات حية بعد — اضغط "جلب البيانات الحية" أو "إنشاء ملف ومشاركته مع جيمناي الداخلي".');
+      return;
+    }
+    setInternalGeminiLoading(true);
+    try {
+      showToast('✨ جاري تحليل الملف عبر جيمناي الداخلي...');
+      await callInternalGemini(content, symbol, fileItem.text.trim() ? '' : promptDraft);
+      setActiveTab('answer');
+      showToast('✅ اكتمل التحليل في جيمناي الداخلي وتم إرسال النتيجة إلى تطبيق الهاتف');
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInternalGeminiLoading(false);
+    }
+  };
+
+  const runCreateFileAndShareInternalGemini = async () => {
+    setErrorMsg('');
+    setInternalGeminiLoading(true);
+    try {
+      const prevVer = fileItemRef.current.ver;
+      if (!dataItemRef.current.text.trim()) {
+        showToast('📥 1/3 جاري جلب البيانات الحية من MT5...');
+        await sendRoomCommand(roomId, 'fetch', currentParams());
+        await new Promise((r) => setTimeout(r, 4500));
+      }
+      showToast('📄 2/3 جاري إنشاء ملف .txt على اللوحة الأم...');
+      await sendRoomCommand(roomId, 'make_file', currentParams());
+
+      // Wait up to 14s for updated fileItem from Firestore
+      const deadline = Date.now() + 14000;
+      while (Date.now() < deadline) {
+        if (fileItemRef.current.ver !== prevVer && fileItemRef.current.text.trim()) break;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+
+      const content = fileItemRef.current.text.trim() || dataItemRef.current.text.trim();
+      if (!content) {
+        throw new Error('لم يصل محتوى الملف من الكمبيوتر بعد — تأكد من تشغيل smc_control_panel.py وجلب البيانات.');
+      }
+
+      showToast('✨ 3/3 جاري مشاركة الملف مع جيمناي الداخلي وعرض النتائج...');
+      await callInternalGemini(content, symbol, fileItemRef.current.text.trim() ? '' : promptDraft);
+      setActiveTab('answer');
+      showToast('✅ تمت مشاركة الملف مع جيمناي الداخلي وتحديث النتيجة في التطبيق والهاتف');
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInternalGeminiLoading(false);
     }
   };
 
@@ -588,11 +741,31 @@ export default function App() {
 
                   <button
                     type="button"
+                    disabled={internalGeminiLoading}
+                    onClick={() => void runCreateFileAndShareInternalGemini()}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-violet-700 text-white rounded-lg hover:bg-violet-800 transition-colors sm:col-span-2 disabled:opacity-60"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>{internalGeminiLoading ? 'جاري التحليل في جيمناي الداخلي...' : 'إنشاء ملف ومشاركته مع جيمناي الداخلي (مباشر)'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={internalGeminiLoading}
+                    onClick={() => void runAnalyzeCurrentWithInternalGemini()}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-fuchsia-700 text-white rounded-lg hover:bg-fuchsia-800 transition-colors sm:col-span-2 disabled:opacity-60"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>تحليل الملف الحالي بجيمناي الداخلي وإرسال النتيجة للهاتف</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => void dispatchCommand('ai', currentParams())}
                     className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 transition-colors"
                   >
                     <Play className="w-4 h-4" />
-                    <span>إنشاء الملف وإرساله للمزوّد</span>
+                    <span>إنشاء الملف وإرساله للمزوّد (PC)</span>
                   </button>
 
                   <button
@@ -807,6 +980,15 @@ export default function App() {
                   </button>
                   <button
                     type="button"
+                    disabled={internalGeminiLoading}
+                    onClick={() => void runCreateFileAndShareInternalGemini()}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-violet-700 text-white rounded-lg hover:bg-violet-800 disabled:opacity-50"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>{internalGeminiLoading ? 'جاري التحليل...' : 'مشاركة مع جيمناي الداخلي'}</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => downloadTextAsset(fileItem.text, fileItem.name)}
                     disabled={!fileItem.text}
                     className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 disabled:opacity-40"
@@ -829,9 +1011,18 @@ export default function App() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-bold text-slate-900">نتيجة التحليل</h2>
-                <div className="text-xs text-slate-500">{roomState?.label || 'Gemini / Claude'}</div>
+                <div className="text-xs text-slate-500">{internalGeminiLabel || roomState?.label || 'Gemini الداخلي / Claude'}</div>
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={internalGeminiLoading}
+                  onClick={() => void runCreateFileAndShareInternalGemini()}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-violet-700 text-white rounded-lg hover:bg-violet-800 disabled:opacity-50"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>{internalGeminiLoading ? 'جاري التحليل...' : 'إنشاء ومشاركة مع جيمناي الداخلي'}</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => void handleCopy(answerItem.text, 'نتيجة التحليل')}

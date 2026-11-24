@@ -85,6 +85,7 @@ DEFAULT_FB_DATABASE_ID = "ai-studio-remotecontrolsyn-df2f1204-af22-4100-8861-97c
 DEFAULT_FB_API_KEY = "AIzaSyCtdkKUAcEa5pZjKxxk1t9HayIq_Pi-ehw"
 DEFAULT_FB_URL = f"firestore://{DEFAULT_FB_PROJECT_ID}/{DEFAULT_FB_DATABASE_ID}"
 DEFAULT_PAIR_CODE = "SMC-AUTO-BRIDGE"
+DEFAULT_INTERNAL_AI_URL = "https://ais-pre-5as3ie4knpzuvhxk3weepk-38839718891.europe-west3.run.app/api/gemini/analyze"
 
 # --------------------------
 # مزوّدو التحليل
@@ -1588,6 +1589,13 @@ class Bridge:
             if tf in TF_MAP:
                 a.chart_tf = tf
             a.refresh_live_chart_once()
+        elif action in ("internal_gemini", "make_file_internal_gemini"):
+            if action == "make_file_internal_gemini":
+                pth = a._prepare_file()
+                if pth is None:
+                    return {"ok": False, "error": LAST_DIALOG[0] or "اجلب البيانات الحية أولاً"}
+                self.tick(force=True)
+            a.start_internal_gemini(remote_relay=True)
         else:
             return {"ok": False, "error": f"أمر غير معروف: {action}"}
         msg = LAST_DIALOG[0]
@@ -1667,16 +1675,17 @@ class Bridge:
                             except Exception:
                                 params = {}
                             res = self.handle(act, params)
-                            resp_doc = {
-                                "kind": "resp",
-                                "id": str(last_cmd)[:80],
-                                "ok": bool(res.get("ok")),
-                                "error": str(res.get("error") or "")[:1200],
-                                "name": str(res.get("name") or "")[:160],
-                                "file_ver": int(res.get("file_ver") or 0),
-                                "ts": int(time.time()),
-                            }
-                            self._fb_check(self._fs_req("PATCH", f"rooms/{room}/items/resp", resp_doc))
+                            if not (act in ("internal_gemini", "make_file_internal_gemini") and res.get("ok") and not self.app.v["gem_key"].get().strip()):
+                                resp_doc = {
+                                    "kind": "resp",
+                                    "id": str(last_cmd)[:80],
+                                    "ok": bool(res.get("ok")),
+                                    "error": str(res.get("error") or "")[:1200],
+                                    "name": str(res.get("name") or "")[:160],
+                                    "file_ver": int(res.get("file_ver") or 0),
+                                    "ts": int(time.time()),
+                                }
+                                self._fb_check(self._fs_req("PATCH", f"rooms/{room}/items/resp", resp_doc))
 
                     # 2) تحديث حالة اللوحة الأم
                     snap = dict(self.snap)
@@ -1908,9 +1917,10 @@ class App(tk.Tk):
         self.b_share["menu"] = share_menu
         self.b_stop = ttk.Button(bf, text="⏹ إيقاف", command=self.stop_ai, state="disabled")
         self.b_chart = ttk.Button(bf, text="📈 عرض الرسم البياني", command=lambda: self.start_live_chart(switch_tab=True, force_remote=True))
-        for b in (self.b_fetch, self.b_gem, self.b_all, self.b_tg, self.b_tgfile, self.b_share, self.b_chart, self.b_stop):
-            b.pack(side="left", padx=4)
-        self.action_buttons = [self.b_connect, self.b_fetch, self.b_gem, self.b_all, self.b_tg, self.b_tgfile,
+        self.b_internal_gem = ttk.Button(bf, text="✨ إنشاء ملف ومشاركته مع جيمناي الداخلي", command=self.start_internal_gemini)
+        for b in (self.b_fetch, self.b_gem, self.b_internal_gem, self.b_all, self.b_tg, self.b_tgfile, self.b_share, self.b_chart, self.b_stop):
+            b.pack(side="left", padx=3)
+        self.action_buttons = [self.b_connect, self.b_fetch, self.b_gem, self.b_internal_gem, self.b_all, self.b_tg, self.b_tgfile,
                                self.b_share, self.b_models]
 
         f4 = ttk.LabelFrame(self, text=" 4) الربط مع تطبيق الهاتف (SMC Phone) — محلي تلقائي + Firebase افتراضياً ")
@@ -2269,6 +2279,79 @@ class App(tk.Tk):
                     self._render_answer(ans, f"التحليل ({c['symbol']}) — {lbl}")
                     self.nb.select(self.res_text.master)
                     self.set_busy(False, f"✅ اكتمل التحليل ({lbl})")
+                    if c["tg_mode"] == "تلقائي" and c["tg_token"] and c["tg_chat"]:
+                        self.send_telegram_async()
+
+                self.ui(ok)
+            except Cancelled:
+                if rid == self.run_id:
+                    self.ui(lambda: self.set_busy(False, "⏹ تم إيقاف التحليل"))
+            except Exception as e:
+                if rid == self.run_id:
+                    err_msg = str(e)
+                    self.ui(lambda: self._fail(err_msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_internal_gemini(self, remote_relay=False):
+        if self.busy:
+            return
+        c = self.cfg()
+        path = self._prepare_file()
+        if path is None:
+            return
+        self.run_id += 1
+        rid = self.run_id
+        tok = CancelToken()
+        self.cancel_token = tok
+        lbl = "Gemini الداخلي (مباشر)"
+        self.set_busy(True, "✨ جاري إنشاء الملف ومشاركته مع جيمناي الداخلي...", ai=True)
+
+        def work():
+            try:
+                file_txt = Path(path).read_text(encoding="utf-8")
+                room = norm_code(c.get("br_code") or DEFAULT_PAIR_CODE).lower()
+                ans = None
+                try:
+                    r = http_call(
+                        tok, "POST", DEFAULT_INTERNAL_AI_URL,
+                        json={"content": file_txt, "symbol": c["symbol"], "roomId": room, "pushToFirebase": True},
+                        timeout=120,
+                    )
+                    ct = (r.headers.get("Content-Type") or "").lower()
+                    if r.status_code == 200 and "application/json" in ct:
+                        js = r.json()
+                        if js.get("ok") and js.get("answer"):
+                            ans = str(js["answer"]).strip()
+                            lbl_used = str(js.get("label") or lbl)
+                except Cancelled:
+                    raise
+                except Exception:
+                    ans = None
+
+                if not ans and c["gem_key"]:
+                    ans = call_gemini(c["gem_key"], c["gem_model"], path, "اقرأ الملف", tok)
+                    lbl_used = f"Gemini ({c['gem_model']})"
+
+                if not ans:
+                    if remote_relay:
+                        self.ui(lambda: self.set_busy(False, "✨ تم رفع الملف — لوحة الويب ستكمل التحليل وإرسال النتيجة"))
+                        return
+                    raise RuntimeError(
+                        "تعذر الوصول إلى نقطة Gemini الداخلية مباشرة من هذا الجهاز.\n"
+                        "افتح لوحة الويب السحابية واضغط 'إنشاء ملف ومشاركته مع جيمناي الداخلي' أو أدخل Gemini API Key."
+                    )
+
+                if rid != self.run_id or tok.is_set():
+                    return
+
+                def ok():
+                    self.last_answer = ans
+                    self.last_label = lbl_used
+                    self._render_answer(ans, f"التحليل ({c['symbol']}) — {lbl_used}")
+                    self.nb.select(self.res_text.master)
+                    self.set_busy(False, f"✅ اكتمل تحليل جيمناي الداخلي ({c['symbol']})")
+                    self.bridge.tick(force=True)
                     if c["tg_mode"] == "تلقائي" and c["tg_token"] and c["tg_chat"]:
                         self.send_telegram_async()
 

@@ -76,6 +76,7 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_FB_API_KEY = "AIzaSyCtdkKUAcEa5pZjKxxk1t9HayIq_Pi-ehw"
         private const val DEFAULT_FB_URL = "firestore://$DEFAULT_FB_PROJECT_ID/$DEFAULT_FB_DATABASE_ID"
         private const val DEFAULT_PAIR_CODE = "SMC-AUTO-BRIDGE"
+        private const val DEFAULT_INTERNAL_AI_URL = "https://ais-pre-5as3ie4knpzuvhxk3weepk-38839718891.europe-west3.run.app/api/gemini/analyze"
 
         private const val BRIDGE_UDP_PORT = 8766
         private const val CHART_REFRESH_SEC = 60
@@ -129,6 +130,7 @@ class MainActivity : AppCompatActivity() {
     private var fbUrl = DEFAULT_FB_URL
     private var fbSecret = DEFAULT_FB_API_KEY
     private var manualLocalUrl = ""
+    private var internalAiUrl = DEFAULT_INTERNAL_AI_URL
     private var discoveredLocalUrl = ""
     private var activeChannel = "none" // "local" | "firebase" | "none"
     private var lastLocalScanMs = 0L
@@ -148,6 +150,11 @@ class MainActivity : AppCompatActivity() {
     private var answerText = ""
     private var promptText = ""
     private var lastListsJson = ""
+    private var lastAnswerTs = 0L
+    private var pollTickCounter = 0
+    @Volatile private var waitingForInternalGemini = false
+    @Volatile private var latestPulledDataText = ""
+    @Volatile private var latestPulledFileText = ""
 
     // Chart streaming state
     private var chartStreaming = false
@@ -194,6 +201,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnMakeFile: MaterialButton
     private lateinit var btnReceiveFile: MaterialButton
     private lateinit var btnWorkflowDownload: MaterialButton
+    private lateinit var btnMakeFileInternalGemini: MaterialButton
+    private lateinit var btnAnalyzeInternalGemini: MaterialButton
     private lateinit var btnOpenChartQuick: MaterialButton
     private lateinit var btnAi: MaterialButton
     private lateinit var btnFetchAi: MaterialButton
@@ -231,6 +240,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etPairCode: EditText
     private lateinit var spConnMode: Spinner
     private lateinit var etManualLocal: EditText
+    private lateinit var etInternalAiUrl: EditText
     private lateinit var etFbUrl: EditText
     private lateinit var etFbSecret: EditText
     private lateinit var tvDiagInfo: TextView
@@ -302,6 +312,7 @@ class MainActivity : AppCompatActivity() {
         fbUrl = p.getString("fb_url", DEFAULT_FB_URL)?.ifBlank { DEFAULT_FB_URL } ?: DEFAULT_FB_URL
         fbSecret = p.getString("fb_secret", DEFAULT_FB_API_KEY)?.ifBlank { DEFAULT_FB_API_KEY } ?: DEFAULT_FB_API_KEY
         manualLocalUrl = p.getString("manual_local", "") ?: ""
+        internalAiUrl = p.getString("internal_ai_url", DEFAULT_INTERNAL_AI_URL)?.ifBlank { DEFAULT_INTERNAL_AI_URL } ?: DEFAULT_INTERNAL_AI_URL
         soundEnabled = p.getBoolean("sound_enabled", true)
         val savedTf = p.getString("chart_tf", "M15") ?: "M15"
         if (TF_NAMES.contains(savedTf)) selectedChartTf = savedTf
@@ -314,6 +325,7 @@ class MainActivity : AppCompatActivity() {
             .putString("fb_url", fbUrl)
             .putString("fb_secret", fbSecret)
             .putString("manual_local", manualLocalUrl)
+            .putString("internal_ai_url", internalAiUrl)
             .putBoolean("sound_enabled", soundEnabled)
             .putString("chart_tf", selectedChartTf)
             .apply()
@@ -794,6 +806,12 @@ class MainActivity : AppCompatActivity() {
         btnWorkflowDownload = makeBtn("⚡ جلب + إنشاء ملف + استلام للهاتف", "#0D9488") {
             runFetchCreateAndDownloadWorkflow()
         }
+        btnMakeFileInternalGemini = makeBtn("✨ إنشاء ملف ومشاركته مع جيمناي الداخلي", "#10B981") {
+            runInternalGeminiWorkflow(createFileFirst = true)
+        }
+        btnAnalyzeInternalGemini = makeBtn("🤖 تحليل الملف الحالي بجيمناي الداخلي", "#0F766E") {
+            runInternalGeminiWorkflow(createFileFirst = false)
+        }
         btnAi = makeBtn("🤖 إنشاء الملف وإرساله للمزوّد", "#4F46E5") {
             pendingAsyncTask = "ai"
             sendAction("ai", collectParams(), pullContentAfter = "answer")
@@ -813,11 +831,13 @@ class MainActivity : AppCompatActivity() {
         }
         btnStop = makeBtn("⏹ إيقاف العملية الحالية", "#DC2626") {
             pendingAsyncTask = null
+            waitingForInternalGemini = false
             sendAction("stop", completionLabel = "إيقاف العملية الحالية")
         }
 
         listOf(
             btnOpenChartQuick, btnFetch, btnMakeFile, btnReceiveFile, btnWorkflowDownload,
+            btnMakeFileInternalGemini, btnAnalyzeInternalGemini,
             btnAi, btnFetchAi, btnTgAnswer, btnTgFile, btnSavePc, btnStop
         ).forEach { c4.addView(it) }
 
@@ -1131,6 +1151,9 @@ class MainActivity : AppCompatActivity() {
             row.addView(b)
         }
         box.addView(row)
+        box.addView(makeBtn("✨ إنشاء ملف ومشاركته مع جيمناي الداخلي", "#10B981") {
+            runInternalGeminiWorkflow(createFileFirst = true)
+        })
 
         val sc = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor(COL_CARD))
@@ -1177,6 +1200,9 @@ class MainActivity : AppCompatActivity() {
             row.addView(b)
         }
         box.addView(row)
+        box.addView(makeBtn("✨ إنشاء ملف ومشاركته مع جيمناي الداخلي الآن", "#10B981") {
+            runInternalGeminiWorkflow(createFileFirst = true)
+        })
 
         val sc = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor(COL_CARD))
@@ -1253,10 +1279,23 @@ class MainActivity : AppCompatActivity() {
         }
         cConn.addView(etFbSecret)
 
+        cConn.addView(TextView(this).apply {
+            text = "رابط جيمناي الداخلي (مربوط تلقائياً بالسيرفر)"
+            setTextColor(Color.parseColor(COL_TEXT_SECONDARY))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        etInternalAiUrl = styleEditText(EditText(this)).apply {
+            hint = DEFAULT_INTERNAL_AI_URL
+            isSingleLine = true
+        }
+        cConn.addView(etInternalAiUrl)
+
         cConn.addView(makeBtn("💾 حفظ الإعدادات وتطبيق الربط", "#059669") {
             pairCode = etPairCode.text.toString().trim().uppercase(Locale.US).ifBlank { DEFAULT_PAIR_CODE }
             connModeIdx = spConnMode.selectedItemPosition.coerceIn(0, 2)
             manualLocalUrl = etManualLocal.text.toString().trim().trimEnd('/')
+            internalAiUrl = etInternalAiUrl.text.toString().trim().ifBlank { DEFAULT_INTERNAL_AI_URL }
             fbUrl = etFbUrl.text.toString().trim().ifBlank { DEFAULT_FB_URL }
             fbSecret = etFbSecret.text.toString().trim().ifBlank { DEFAULT_FB_API_KEY }
             savePrefs()
@@ -1273,6 +1312,7 @@ class MainActivity : AppCompatActivity() {
             pairCode = DEFAULT_PAIR_CODE
             fbUrl = DEFAULT_FB_URL
             fbSecret = DEFAULT_FB_API_KEY
+            internalAiUrl = DEFAULT_INTERNAL_AI_URL
             connModeIdx = 0
             savePrefs()
             applyPrefsToSettingsUi()
@@ -1305,6 +1345,7 @@ class MainActivity : AppCompatActivity() {
         etPairCode.setText(pairCode)
         spConnMode.setSelection(connModeIdx)
         etManualLocal.setText(manualLocalUrl)
+        etInternalAiUrl.setText(internalAiUrl)
         etFbUrl.setText(fbUrl)
         etFbSecret.setText(fbSecret)
     }
@@ -1517,6 +1558,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        pollTickCounter += 1
+        val tick = pollTickCounter
+
         netExec.execute {
             var snap: JSONObject? = null
             var channel = "none"
@@ -1577,13 +1621,46 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            // 3) Directly poll Firestore items/answer so Web/Server Internal Gemini results appear instantly on Phone
+            if (isFirestoreUrl(fbUrl) && connModeIdx != 1 && (tick % 2 == 0 || waitingForInternalGemini)) {
+                try {
+                    val room = code.lowercase(Locale.US)
+                    val keyParam = URLEncoder.encode(fbSecret.ifBlank { DEFAULT_FB_API_KEY }, "UTF-8")
+                    val ansUrl = "${firestoreBaseUrl()}/rooms/$room/items/answer?key=$keyParam"
+                    val (asc, abody) = httpJson(ansUrl, "GET", timeoutMs = 5000)
+                    if (asc == 200) {
+                        val doc = fsDecodeDoc(abody)
+                        val ansTs = doc.optLong("ts", 0L)
+                        val ansName = doc.optString("name", "جيمناي الداخلي")
+                        val ansText = doc.optString("text", "")
+                        val isNewer = ansText.isNotBlank() && (ansTs > lastAnswerTs || (ansTs == 0L && ansText != answerText))
+                        if (isNewer) {
+                            lastAnswerTs = ansTs
+                            val wasWaiting = waitingForInternalGemini
+                            waitingForInternalGemini = false
+                            mainHandler.post {
+                                answerText = ansText
+                                tvAnswerContent.text = ansText
+                                if (ansName.isNotBlank()) tvAnswerLabel.text = ansName
+                                if (wasWaiting) {
+                                    progressBusy.visibility = View.GONE
+                                    tabLayout.getTabAt(5)?.select()
+                                    notifyActionCompleted(true, "تم استلام نتيجة تحليل جيمناي الداخلي", ansName)
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+
             mainHandler.post {
                 activeChannel = channel
                 if (snap != null) {
                     applySnapshotToUi(snap, channel)
                 } else {
-                    tvChannelBadge.text = "🔴 غير متصل"
-                    if (errMsg.isNotBlank()) tvStatusBar.text = errMsg
+                    tvChannelBadge.text = if (isFirestoreUrl(fbUrl)) "☁️ جاهز (جيمناي / Firebase)" else "🔴 غير متصل"
+                    if (errMsg.isNotBlank() && !waitingForInternalGemini) tvStatusBar.text = errMsg
                 }
             }
         }
@@ -1863,6 +1940,114 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun runInternalGeminiWorkflow(createFileFirst: Boolean) {
+        val code = normCode(pairCode)
+        if (code.length < 12) {
+            notifyActionCompleted(false, "رمز الربط غير مكتمل")
+            return
+        }
+        val selectedSym = spSymbol.selectedItem?.toString() ?: "XAUUSD"
+        val currentPrompt = if (::etPrompt.isInitialized) etPrompt.text.toString() else promptText
+        val params = collectParams()
+
+        mainHandler.post {
+            progressBusy.visibility = View.VISIBLE
+            tvStatusBar.text = if (createFileFirst) {
+                "✨ 1/3 جاري تجهيز البيانات وإنشاء الملف لمشاركته مع جيمناي الداخلي..."
+            } else {
+                "🤖 جاري إرسال الملف إلى جيمناي الداخلي للتحليل..."
+            }
+        }
+
+        netExec.execute {
+            try {
+                if (createFileFirst) {
+                    if (dataText.isBlank() && latestPulledDataText.isBlank()) {
+                        mainHandler.post { tvStatusBar.text = "📥 1/3 جاري جلب البيانات الحية من MT5..." }
+                        val rFetch = executeRemoteAction(code, "fetch", params)
+                        if (rFetch.optBoolean("ok", false)) {
+                            val deadline = System.currentTimeMillis() + 90000L
+                            Thread.sleep(1500)
+                            while (System.currentTimeMillis() < deadline) {
+                                val s = lastSnap
+                                if (s != null && !s.optBoolean("busy", false)) break
+                                Thread.sleep(900)
+                            }
+                            pullContentBlocking("data", saveToDownloads = false)
+                        }
+                    }
+
+                    mainHandler.post { tvStatusBar.text = "📄 2/3 جاري إنشاء ملف .txt على الكمبيوتر..." }
+                    val rMake = executeRemoteAction(code, "make_file", params)
+                    if (rMake.optBoolean("ok", false)) {
+                        Thread.sleep(700)
+                        pullContentBlocking("file", saveToDownloads = false)
+                    }
+                } else if (fileText.isBlank() && latestPulledFileText.isBlank()) {
+                    pullContentBlocking("file", saveToDownloads = false)
+                }
+
+                val targetContent = latestPulledFileText
+                    .ifBlank { fileText }
+                    .ifBlank { latestPulledDataText }
+                    .ifBlank { dataText }
+
+                if (targetContent.isNotBlank() && internalAiUrl.isNotBlank()) {
+                    mainHandler.post { tvStatusBar.text = "✨ 3/3 جاري مشاركة الملف مع جيمناي الداخلي..." }
+                    try {
+                        val payload = JSONObject().apply {
+                            put("content", targetContent)
+                            put("symbol", selectedSym)
+                            put("prompt", currentPrompt)
+                            put("roomId", code.lowercase(Locale.US))
+                            put("pushToFirebase", true)
+                        }.toString()
+                        val (sc, body) = httpJson(internalAiUrl, "POST", payload, timeoutMs = 90000)
+                        if (sc == 200 && body.trimStart().startsWith("{")) {
+                            val res = JSONObject(body)
+                            val ans = res.optString("answer", "")
+                            if (res.optBoolean("ok", false) && ans.isNotBlank()) {
+                                val lbl = "✨ تحليل جيمناي الداخلي (${res.optString("model", "gemini-4-hydrogen")})"
+                                lastAnswerTs = System.currentTimeMillis() / 1000L
+                                waitingForInternalGemini = false
+                                mainHandler.post {
+                                    progressBusy.visibility = View.GONE
+                                    answerText = ans
+                                    tvAnswerLabel.text = lbl
+                                    tvAnswerContent.text = ans
+                                    tabLayout.getTabAt(5)?.select()
+                                    notifyActionCompleted(true, "تمت مشاركة الملف واكتمل التحليل في جيمناي الداخلي", selectedSym)
+                                }
+                                return@execute
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        // Fall back seamlessly to Firebase/Local command relay below
+                    }
+                }
+
+                // Fallback relay via Firebase/Local Bridge (fulfilled by Web Companion or PC)
+                waitingForInternalGemini = true
+                val actionName = if (createFileFirst) "make_file_internal_gemini" else "internal_gemini"
+                val relayRes = executeRemoteAction(code, actionName, params)
+                val relayOk = relayRes.optBoolean("ok", true)
+                if (!relayOk) {
+                    waitingForInternalGemini = false
+                    mainHandler.post { progressBusy.visibility = View.GONE }
+                    notifyActionCompleted(false, "تعذر تشغيل جيمناي الداخلي", relayRes.optString("error", ""))
+                } else {
+                    mainHandler.post {
+                        tvStatusBar.text = "⏳ تم إرسال الملف لجيمناي الداخلي عبر Firebase — بانتظار النتيجة..."
+                    }
+                }
+            } catch (e: Throwable) {
+                waitingForInternalGemini = false
+                mainHandler.post { progressBusy.visibility = View.GONE }
+                notifyActionCompleted(false, "خطأ أثناء الاتصال بجيمناي الداخلي", e.message ?: "")
+            }
+        }
+    }
+
     private fun pullContentBlocking(key: String, saveToDownloads: Boolean): Boolean {
         val code = normCode(pairCode)
         if (code.length < 12) return false
@@ -1894,6 +2079,13 @@ class MainActivity : AppCompatActivity() {
         val text = c.optString("text", "")
         if (text.isBlank()) return false
 
+        if (key == "data") latestPulledDataText = text
+        if (key == "file") latestPulledFileText = text
+        if (key == "answer") {
+            val tsVal = c.optLong("ts", 0L)
+            if (tsVal > lastAnswerTs) lastAnswerTs = tsVal
+        }
+
         mainHandler.post {
             when (key) {
                 "data" -> {
@@ -1915,6 +2107,13 @@ class MainActivity : AppCompatActivity() {
                 "answer" -> {
                     answerText = text
                     tvAnswerContent.text = text
+                    if (name.isNotBlank() && name != "SMC_answer.txt") tvAnswerLabel.text = name
+                    if (waitingForInternalGemini) {
+                        waitingForInternalGemini = false
+                        progressBusy.visibility = View.GONE
+                        tabLayout.getTabAt(5)?.select()
+                        notifyActionCompleted(true, "تم استلام نتيجة تحليل جيمناي الداخلي", name)
+                    }
                 }
                 "prompt" -> {
                     promptText = text
