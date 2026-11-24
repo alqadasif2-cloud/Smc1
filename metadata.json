@@ -1,0 +1,8 @@
+{
+  "name": "SMC Remote Bridge & APK Studio",
+  "description": "لوحة تحكم SMC السحابية المربوطة بـ Firebase مع سكربت بايثون ومشروع Android APK جاهز لـ GitHub Actions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,144 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function emailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoomId(roomId) {
+      return roomId is string && roomId.size() >= 12 && roomId.size() <= 64 && roomId.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidItemId(itemId) {
+      return itemId in ['data', 'file', 'answer', 'prompt', 'lists', 'cmd', 'resp'];
+    }
+
+    function isValidRoomState(data) {
+      return data.keys().hasAll(['ok', 'name', 'mt5', 'busy', 'ai', 'symbol', 'ts'])
+        && data.keys().hasOnly([
+          'ok', 'name', 'mt5', 'conn', 'busy', 'ai', 'status', 'price',
+          'symbol', 'tfsJson', 'chain', 'provider', 'gem_model', 'claude_model',
+          'tg_mode', 'label', 'versJson', 'log', 'ts'
+        ])
+        && data.ok is number
+        && data.name is string && data.name.size() <= 120
+        && data.mt5 is bool
+        && data.busy is bool
+        && data.ai is bool
+        && data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 40
+        && data.ts is number
+        && (!('conn' in data) || (data.conn is string && data.conn.size() <= 120))
+        && (!('status' in data) || (data.status is string && data.status.size() <= 400))
+        && (!('price' in data) || (data.price is string && data.price.size() <= 240))
+        && (!('tfsJson' in data) || (data.tfsJson is string && data.tfsJson.size() <= 500))
+        && (!('chain' in data) || data.chain is bool)
+        && (!('provider' in data) || (data.provider is string && data.provider.size() <= 80))
+        && (!('gem_model' in data) || (data.gem_model is string && data.gem_model.size() <= 100))
+        && (!('claude_model' in data) || (data.claude_model is string && data.claude_model.size() <= 100))
+        && (!('tg_mode' in data) || (data.tg_mode is string && data.tg_mode.size() <= 30))
+        && (!('label' in data) || (data.label is string && data.label.size() <= 120))
+        && (!('versJson' in data) || (data.versJson is string && data.versJson.size() <= 1000))
+        && (!('log' in data) || (data.log is string && data.log.size() <= 6000));
+    }
+
+    function isValidRoomItem(itemId, data) {
+      return data.keys().hasAll(['kind', 'ts'])
+        && data.keys().hasOnly(['kind', 'name', 'text', 'ver', 'id', 'action', 'paramsJson', 'ok', 'error', 'file_ver', 'ts'])
+        && data.kind is string && data.kind == itemId && data.kind.size() <= 20
+        && data.ts is number
+        && (!('name' in data) || (data.name is string && data.name.size() <= 160))
+        && (!('text' in data) || (data.text is string && data.text.size() <= 750000))
+        && (!('ver' in data) || data.ver is number)
+        && (!('id' in data) || (data.id is string && data.id.size() <= 80 && data.id.matches('^[a-zA-Z0-9_\\-]+$')))
+        && (!('action' in data) || (data.action is string && data.action.size() <= 40 && data.action.matches('^[a-zA-Z0-9_\\-]+$')))
+        && (!('paramsJson' in data) || (data.paramsJson is string && data.paramsJson.size() <= 30000))
+        && (!('ok' in data) || data.ok is bool)
+        && (!('error' in data) || (data.error is string && data.error.size() <= 1200))
+        && (!('file_ver' in data) || data.file_ver is number);
+    }
+
+    function isValidUserProfile(userId, data) {
+      return data.keys().hasAll(['uid', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid.size() <= 128
+        && data.updatedAt is number
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && (!('email' in data) || (data.email is string && data.email.size() <= 180));
+    }
+
+    function isValidSavedRoom(userId, roomId, data) {
+      return data.keys().hasAll(['ownerId', 'roomId', 'pairCode', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'roomId', 'pairCode', 'alias', 'updatedAt'])
+        && data.ownerId is string && data.ownerId == userId && data.ownerId.size() <= 128
+        && data.roomId is string && data.roomId == roomId && isValidRoomId(data.roomId)
+        && data.pairCode is string && data.pairCode.size() >= 12 && data.pairCode.size() <= 32
+        && data.updatedAt is number
+        && (!('alias' in data) || (data.alias is string && data.alias.size() <= 80));
+    }
+
+    match /test/connection {
+      allow get: if isSignedIn();
+      allow list, create, update, delete: if false;
+    }
+
+    match /rooms/{roomId} {
+      allow get: if isValidRoomId(roomId);
+      allow list: if false;
+      allow create, update: if isValidRoomId(roomId) && isValidRoomState(incoming());
+      allow delete: if false;
+
+      match /items/{itemId} {
+        allow get: if isValidRoomId(roomId) && isValidItemId(itemId);
+        allow list: if false;
+        allow create, update: if isValidRoomId(roomId) && isValidItemId(itemId) && isValidRoomItem(itemId, incoming());
+        allow delete: if false;
+      }
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId) && isOwner(userId) && emailVerified() && isValidUserProfile(userId, incoming());
+      allow update: if isValidId(userId) && isOwner(userId) && emailVerified()
+        && isValidUserProfile(userId, incoming())
+        && incoming().uid == existing().uid;
+      allow delete: if false;
+
+      match /savedRooms/{roomId} {
+        allow get: if isValidRoomId(roomId) && isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isValidRoomId(roomId) && isOwner(userId) && emailVerified()
+          && isValidSavedRoom(userId, roomId, incoming());
+        allow update: if isValidRoomId(roomId) && isOwner(userId) && emailVerified()
+          && isValidSavedRoom(userId, roomId, incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().roomId == existing().roomId;
+        allow delete: if isValidRoomId(roomId) && isOwner(userId);
+      }
+    }
+  }
+}

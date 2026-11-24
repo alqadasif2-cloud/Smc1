@@ -1,0 +1,97 @@
+{
+  "entities": {
+    "BridgeRoom": {
+      "title": "BridgeRoom",
+      "description": "Live state snapshot of the SMC PC Control Panel paired via a 12-character cryptographic pairing code.",
+      "type": "object",
+      "properties": {
+        "ok": { "type": "number", "description": "Heartbeat indicator (1 when active)" },
+        "name": { "type": "string", "maxLength": 120, "description": "PC hostname" },
+        "mt5": { "type": "boolean", "description": "MT5 connection state" },
+        "conn": { "type": "string", "maxLength": 120, "description": "MT5 connection label" },
+        "busy": { "type": "boolean", "description": "Whether PC is executing an operation" },
+        "ai": { "type": "boolean", "description": "Whether AI analysis is running" },
+        "status": { "type": "string", "maxLength": 400, "description": "Status bar message" },
+        "price": { "type": "string", "maxLength": 240, "description": "Live Bid/Ask price string" },
+        "symbol": { "type": "string", "maxLength": 40, "description": "Active trading symbol" },
+        "tfsJson": { "type": "string", "maxLength": 500, "description": "JSON map of selected timeframes" },
+        "chain": { "type": "boolean", "description": "Auto-analyze after fetch flag" },
+        "provider": { "type": "string", "maxLength": 80, "description": "Selected AI provider" },
+        "gem_model": { "type": "string", "maxLength": 100, "description": "Selected Gemini model" },
+        "claude_model": { "type": "string", "maxLength": 100, "description": "Selected Claude model" },
+        "tg_mode": { "type": "string", "maxLength": 30, "description": "Telegram mode (يدوي/تلقائي)" },
+        "label": { "type": "string", "maxLength": 120, "description": "Active analysis label" },
+        "versJson": { "type": "string", "maxLength": 1000, "description": "JSON map of content versions" },
+        "log": { "type": "string", "maxLength": 6000, "description": "Tail of PC execution log" },
+        "ts": { "type": "number", "description": "Unix timestamp in seconds" }
+      },
+      "required": ["ok", "name", "mt5", "busy", "ai", "symbol", "ts"]
+    },
+    "RoomItem": {
+      "title": "RoomItem",
+      "description": "Synchronized payload item (data, file, answer, prompt, lists, cmd, resp) inside a paired room.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["data", "file", "answer", "prompt", "lists", "cmd", "resp"],
+          "maxLength": 20
+        },
+        "name": { "type": "string", "maxLength": 160 },
+        "text": { "type": "string", "maxLength": 750000 },
+        "ver": { "type": "number" },
+        "id": { "type": "string", "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "action": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "paramsJson": { "type": "string", "maxLength": 30000 },
+        "ok": { "type": "boolean" },
+        "error": { "type": "string", "maxLength": 1200 },
+        "file_ver": { "type": "number" },
+        "ts": { "type": "number" }
+      },
+      "required": ["kind", "ts"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Web console user profile for saving paired PC rooms.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "email": { "type": "string", "maxLength": 180 },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["uid", "updatedAt"]
+    },
+    "SavedRoom": {
+      "title": "SavedRoom",
+      "description": "User-saved pairing code shortcut.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "roomId": { "type": "string", "minLength": 12, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "pairCode": { "type": "string", "maxLength": 32 },
+        "alias": { "type": "string", "maxLength": 80 },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["ownerId", "roomId", "pairCode", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/BridgeRoom" },
+      "description": "Live telemetry and control state for a paired SMC desktop instance."
+    },
+    "/rooms/{roomId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/RoomItem" },
+      "description": "Commands, responses, live data, generated .txt files, prompts, and analysis answers."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Signed-in web user profile."
+    },
+    "/users/{userId}/savedRooms/{roomId}": {
+      "schema": { "$ref": "#/entities/SavedRoom" },
+      "description": "Saved pairing codes belonging to a signed-in user."
+    }
+  }
+}
